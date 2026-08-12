@@ -28,6 +28,7 @@ Stages 1–4 are shared across backbones; activation collection (a) and
 the intervention hook (k) are backbone-specific. Per-backbone guides:
 
 - **openVLA** — [docs/openvla.md](docs/openvla.md)
+- **현재 Spatial-500 재현** — [docs/reproduce_libero_spatial_500.md](docs/reproduce_libero_spatial_500.md)
 - **openpi (π₀.₅)** — [docs/openpi.md](docs/openpi.md)
 
 Each guide includes installation, the full pipeline (steps a–k),
@@ -51,10 +52,12 @@ event_sae/                     core library
   scoring/                     feature scoring + ranking (h–j)
     score_matrix.py            event-feature score matrix (i)
     rankings.py                four ranking strategies (j)
+  evaluate.py                  offline SAE fidelity (FVE, MSE, alive, L0)
   openvla/                     openVLA backbone: collection (a) + intervention (k)
   openpi/                      openpi backbone: collection (a) + intervention (k)
 scripts/                       CLI entry points, one per step
   train_sae.py                          (b)
+  evaluate_sae.py                       offline SAE fidelity
   extract_keyframes.py                  (c)
   extract_keyframe_media.py             (d)
   build_event_features.py               (e)

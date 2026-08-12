@@ -38,9 +38,18 @@ def _l2_normalize(vec: np.ndarray) -> np.ndarray:
 
 
 class VisionEmbedder:
-    def __init__(self, model_name_or_path: str, device: str) -> None:
-        self.processor = AutoProcessor.from_pretrained(model_name_or_path)
-        self.model = AutoModel.from_pretrained(model_name_or_path).eval().to(device)
+    def __init__(
+        self, model_name_or_path: str, device: str, revision: str | None = None
+    ) -> None:
+        revision_kwargs = {"revision": revision} if revision else {}
+        self.processor = AutoProcessor.from_pretrained(
+            model_name_or_path, **revision_kwargs
+        )
+        self.model = (
+            AutoModel.from_pretrained(model_name_or_path, **revision_kwargs)
+            .eval()
+            .to(device)
+        )
         self.device = torch.device(device)
 
     @torch.no_grad()
@@ -143,6 +152,7 @@ def build_event_features(
     samples_path: Path,
     output_path: Path,
     vision_model_name_or_path: str = "google/siglip-base-patch16-224",
+    vision_model_revision: str | None = None,
     device: str | None = None,
     frame_positions: list[int] = (0, 1, 2, 3, 4),
 ) -> None:
@@ -156,7 +166,9 @@ def build_event_features(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     samples = load_jsonl(samples_path)
     state_index = build_episode_state_index(samples)
-    embedder = VisionEmbedder(vision_model_name_or_path, device)
+    embedder = VisionEmbedder(
+        vision_model_name_or_path, device, revision=vision_model_revision
+    )
 
     records: list[dict] = []
     for idx, sample in enumerate(samples, start=1):
@@ -188,6 +200,7 @@ def build_event_features(
                 "selected_frame_paths": selected_frame_paths,
                 "source_trajectory_records_path": trajectory_path,
                 "vision_model_name_or_path": vision_model_name_or_path,
+                "vision_model_revision": vision_model_revision,
                 "vision_frame_positions": list(frame_positions),
                 "vision_embedding": vision_embedding.astype(np.float32).tolist(),
                 "state_vector": state_vector.tolist(),

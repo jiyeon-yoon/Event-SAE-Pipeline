@@ -208,10 +208,15 @@ def join_cluster_events(
     *,
     event_features: list[dict],
     cluster_assignments: list[dict],
-    cluster_annotations: list[dict],
+    cluster_annotations: list[dict] | None = None,
+    clusters: list[dict] | None = None,
 ) -> _JoinResult:
-    """Join event_features + cluster_assignments + cluster_annotations, filter
-    out clusters with API/parse errors or empty phrase/phase."""
+    """Join events to clusters; VLM labels are descriptive, not membership.
+
+    When ``clusters`` is supplied, its clustering output is authoritative and
+    a missing/invalid Gemini annotation does not silently remove an event from
+    feature ranking. Passing annotations alone retains the legacy behavior.
+    """
     event_by_sample_id = {}
     for record in event_features:
         sample_id = str(record["sample_id"])
@@ -228,10 +233,33 @@ def join_cluster_events(
         "skipped_empty_phase": 0,
         "skipped_missing_cluster_annotation": 0,
         "skipped_missing_event_features": 0,
+        "clusters_without_valid_annotation": 0,
     }
 
     cluster_metadata_by_id: dict[str, dict] = {}
-    for annotation in cluster_annotations:
+    for cluster in clusters or []:
+        cluster_id = str(cluster["cluster_id"])
+        if cluster_id in cluster_metadata_by_id:
+            raise ValueError(f"Duplicate cluster_id in clusters: {cluster_id}")
+        cluster_metadata_by_id[cluster_id] = {
+            "cluster_id": cluster_id,
+            "task_description": str(cluster["task_description"]),
+            "phrase": cluster_id,
+            "phase": "unlabeled",
+            "episode_coverage": float(cluster.get("episode_coverage", 0.0)),
+            "model": "",
+            "prompt_version": "",
+            "annotation_valid": False,
+            "representative_sample_ids": list(cluster.get("representative_sample_ids", [])),
+            "representative_clip_paths": list(cluster.get("representative_clip_paths", [])),
+            "representative_frame_paths": list(cluster.get("representative_frame_paths", [])),
+            "representative_progress_percents": list(
+                cluster.get("representative_progress_percents", [])
+            ),
+        }
+
+    for annotation in cluster_annotations or []:
+        cluster_id = str(annotation["cluster_id"])
         if annotation.get("api_error") is not None:
             counts["skipped_api_error"] += 1
             continue
@@ -246,10 +274,12 @@ def join_cluster_events(
         if not phase:
             counts["skipped_empty_phase"] += 1
             continue
-        cluster_id = str(annotation["cluster_id"])
-        if cluster_id in cluster_metadata_by_id:
+        if clusters is None and cluster_id in cluster_metadata_by_id:
             raise ValueError(f"Duplicate cluster_id in cluster annotations: {cluster_id}")
-        cluster_metadata_by_id[cluster_id] = {
+        if clusters is not None and cluster_id not in cluster_metadata_by_id:
+            counts["skipped_missing_cluster_annotation"] += 1
+            continue
+        annotation_meta = {
             "cluster_id": cluster_id,
             "task_description": str(annotation["task_description"]),
             "phrase": phrase,
@@ -257,11 +287,22 @@ def join_cluster_events(
             "episode_coverage": float(annotation.get("episode_coverage", 0.0)),
             "model": str(annotation.get("model", "")),
             "prompt_version": str(annotation.get("prompt_version", "")),
+            "annotation_valid": True,
             "representative_sample_ids": list(annotation.get("representative_sample_ids", [])),
             "representative_clip_paths": list(annotation.get("representative_clip_paths", [])),
             "representative_frame_paths": list(annotation.get("representative_frame_paths", [])),
             "representative_progress_percents": list(annotation.get("representative_progress_percents", [])),
         }
+        if clusters is None:
+            cluster_metadata_by_id[cluster_id] = annotation_meta
+        else:
+            base = cluster_metadata_by_id[cluster_id]
+            if base["task_description"] != annotation_meta["task_description"]:
+                raise ValueError(f"Task description mismatch for cluster_id={cluster_id}")
+            base.update(annotation_meta)
+    counts["clusters_without_valid_annotation"] = sum(
+        not bool(meta.get("annotation_valid")) for meta in cluster_metadata_by_id.values()
+    )
     counts["valid_clusters"] = len(cluster_metadata_by_id)
 
     joined_events: list[dict] = []
@@ -354,6 +395,7 @@ def _load_timestep_vectors(
     episode_to_task_id: dict[int, int],
     task_id_set: set[int],
     dict_size: int,
+    required_timestep_keys: set[tuple[int, int]] | None = None,
 ) -> tuple[
     dict[tuple[int, int], torch.Tensor],
     dict[int, torch.Tensor],
@@ -383,6 +425,21 @@ def _load_timestep_vectors(
         "rows_skipped_nonexecuted": 0,
         "rows_skipped_no_effective_step": 0,
     }
+    # OpenVLA rows are already ordered by (episode, environment step). Stream
+    # one timestep at a time so task means do not require a dense 32,768-D
+    # vector for every timestep in the 500-rollout dataset. Only event-window
+    # timesteps are retained for later scoring.
+    if step_mapping == "inference_step":
+        return _load_openvla_timestep_vectors_streaming(
+            topk_run_dir,
+            manifest=manifest,
+            episode_to_task_id=episode_to_task_id,
+            task_id_set=task_id_set,
+            dict_size=dict_size,
+            required_timestep_keys=required_timestep_keys,
+            counters=counters,
+        )
+
     timestep_sums: dict[tuple[int, int], torch.Tensor] = {}
     timestep_counts: dict[tuple[int, int], int] = defaultdict(int)
     timestep_task_ids: dict[tuple[int, int], int] = {}
@@ -447,12 +504,13 @@ def _load_timestep_vectors(
                 timestep_counts[key] += 1
                 counters["rows_used"] += 1
 
-    # Per-timestep mean.
-    timestep_vectors: dict[tuple[int, int], torch.Tensor] = {}
-    for key, vec_sum in timestep_sums.items():
+    # Normalize in place. Keeping a second dense vector dictionary here can
+    # double host RAM for a full Spatial run, while sums are no longer needed.
+    timestep_vectors = timestep_sums
+    for key, vec_sum in timestep_vectors.items():
         c = timestep_counts[key]
         if c > 0:
-            timestep_vectors[key] = vec_sum / float(c)
+            vec_sum.div_(float(c))
 
     # Per-task mean of per-timestep vectors. Mirrors openpi-mech.
     task_sums: dict[int, torch.Tensor] = {}
@@ -472,12 +530,143 @@ def _load_timestep_vectors(
     return timestep_vectors, task_means, dict(task_counts), manifest, counters
 
 
+def _load_openvla_timestep_vectors_streaming(
+    topk_run_dir: Path,
+    *,
+    manifest: dict,
+    episode_to_task_id: dict[int, int],
+    task_id_set: set[int],
+    dict_size: int,
+    required_timestep_keys: set[tuple[int, int]] | None,
+    counters: dict[str, int],
+):
+    """Vectorized OpenVLA aggregation with bounded host memory.
+
+    Dense activation and offline Top-K shards preserve rollout order. We
+    validate that invariant and finalize each timestep once, retaining only
+    timesteps used by event windows while still computing task means over the
+    full dataset.
+    """
+    timestep_vectors: dict[tuple[int, int], torch.Tensor] = {}
+    task_sums: dict[int, torch.Tensor] = {}
+    task_counts: dict[int, int] = defaultdict(int)
+    pending_key: tuple[int, int] | None = None
+    pending_sum: torch.Tensor | None = None
+    pending_count = 0
+    previous_key: tuple[int, int] | None = None
+    max_episode = max(episode_to_task_id, default=0)
+    episode_task_lookup = torch.full((max_episode + 1,), -1, dtype=torch.int64)
+    for episode, task_id in episode_to_task_id.items():
+        if 0 <= episode <= max_episode:
+            episode_task_lookup[episode] = int(task_id)
+    allowed_tasks = torch.zeros(
+        max(max(task_id_set, default=0) + 1, 1), dtype=torch.bool
+    )
+    for task_id in task_id_set:
+        if task_id >= 0:
+            allowed_tasks[task_id] = True
+
+    def finalize() -> None:
+        nonlocal pending_key, pending_sum, pending_count
+        if pending_key is None or pending_sum is None or pending_count <= 0:
+            return
+        mean = pending_sum / float(pending_count)
+        task_id = episode_to_task_id[pending_key[0]]
+        if task_id not in task_sums:
+            task_sums[task_id] = torch.zeros(dict_size, dtype=torch.float32)
+        task_sums[task_id].add_(mean)
+        task_counts[task_id] += 1
+        if required_timestep_keys is None or pending_key in required_timestep_keys:
+            timestep_vectors[pending_key] = mean
+        pending_key = None
+        pending_sum = None
+        pending_count = 0
+
+    shard_iter = manifest["shards"]
+    if tqdm is not None:
+        shard_iter = tqdm(shard_iter, desc="Streaming OpenVLA topk shards", unit="shard")
+    for shard_meta in shard_iter:
+        payload = torch.load(
+            _resolve_shard_path(topk_run_dir, shard_meta["path"]), map_location="cpu"
+        )
+        counters["shards_loaded"] += 1
+        episodes = payload["episode_num"].to(dtype=torch.int64)
+        steps = payload["step_in_episode"].to(dtype=torch.int64)
+        feature_ids = payload["top_feature_ids"].to(dtype=torch.int64)
+        feature_values = payload["top_feature_vals"].to(dtype=torch.float32)
+        counters["rows_seen"] += int(episodes.shape[0])
+
+        episode_in_range = (episodes >= 0) & (episodes <= max_episode)
+        row_task_ids = torch.full_like(episodes, -1)
+        row_task_ids[episode_in_range] = episode_task_lookup[episodes[episode_in_range]]
+        task_in_range = (row_task_ids >= 0) & (row_task_ids < len(allowed_tasks))
+        task_allowed = torch.zeros_like(task_in_range)
+        task_allowed[task_in_range] = allowed_tasks[row_task_ids[task_in_range]]
+        valid_task = episode_in_range & task_allowed
+        valid = valid_task & (steps >= 0)
+        counters["rows_skipped_unknown_task"] += int((~valid_task).sum().item())
+        counters["rows_skipped_no_effective_step"] += int(
+            (valid_task & (steps < 0)).sum().item()
+        )
+        if not bool(valid.any()):
+            continue
+        episodes = episodes[valid]
+        steps = steps[valid]
+        feature_ids = feature_ids[valid]
+        feature_values = feature_values[valid]
+        counters["rows_used"] += int(episodes.shape[0])
+
+        pairs = torch.stack((episodes, steps), dim=1)
+        unique_pairs, inverse, row_counts = torch.unique_consecutive(
+            pairs, dim=0, return_inverse=True, return_counts=True
+        )
+        group_sums = torch.zeros(
+            (int(unique_pairs.shape[0]), dict_size), dtype=torch.float32
+        )
+        group_indices = inverse[:, None].expand_as(feature_ids).reshape(-1)
+        group_sums.index_put_(
+            (group_indices, feature_ids.reshape(-1)),
+            feature_values.reshape(-1),
+            accumulate=True,
+        )
+
+        for group_idx, pair in enumerate(unique_pairs.tolist()):
+            key = (int(pair[0]), int(pair[1]))
+            if previous_key is not None and key < previous_key:
+                raise ValueError(
+                    "OpenVLA Top-K rows are not ordered by episode/step; "
+                    "streaming aggregation would be unsafe."
+                )
+            previous_key = key
+            group_sum = group_sums[group_idx]
+            group_count = int(row_counts[group_idx])
+            if key == pending_key:
+                pending_sum.add_(group_sum)
+                pending_count += group_count
+            else:
+                finalize()
+                pending_key = key
+                pending_sum = group_sum.clone()
+                pending_count = group_count
+    finalize()
+
+    task_means = {
+        task_id: value / float(task_counts[task_id])
+        for task_id, value in task_sums.items()
+        if task_counts[task_id] > 0
+    }
+    counters["timestep_vectors_retained"] = len(timestep_vectors)
+    counters["timestep_vectors_total"] = sum(task_counts.values())
+    return timestep_vectors, task_means, dict(task_counts), manifest, counters
+
+
 def score_cluster_features(
     *,
     topk_run_dir: Path,
     event_features_path: Path,
     cluster_assignments_path: Path,
-    cluster_annotations_path: Path,
+    cluster_annotations_path: Path | None,
+    clusters_path: Path | None = None,
     output_path: Path,
     window_size: int = 5,
     top_n: int = 20,
@@ -501,7 +690,12 @@ def score_cluster_features(
     topk_run_dir = Path(topk_run_dir).resolve()
     event_features_path = Path(event_features_path).resolve()
     cluster_assignments_path = Path(cluster_assignments_path).resolve()
-    cluster_annotations_path = Path(cluster_annotations_path).resolve()
+    cluster_annotations_path = (
+        Path(cluster_annotations_path).resolve() if cluster_annotations_path is not None else None
+    )
+    clusters_path = Path(clusters_path).resolve() if clusters_path is not None else None
+    if cluster_annotations_path is None and clusters_path is None:
+        raise ValueError("Provide --clusters-path and/or --cluster-annotations-path.")
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -516,7 +710,10 @@ def score_cluster_features(
     join = join_cluster_events(
         event_features=load_jsonl(event_features_path),
         cluster_assignments=load_jsonl(cluster_assignments_path),
-        cluster_annotations=load_jsonl(cluster_annotations_path),
+        cluster_annotations=(
+            load_jsonl(cluster_annotations_path) if cluster_annotations_path is not None else None
+        ),
+        clusters=load_jsonl(clusters_path) if clusters_path is not None else None,
     )
     if not join.selected_events:
         raise RuntimeError("No usable clustered events after the join.")
@@ -568,12 +765,18 @@ def score_cluster_features(
             episode_to_task_id[ep] = tid
     task_id_set: set[int] = set(event_episode_to_task_id.values())
 
+    required_timestep_keys = {
+        (int(event["episode_num"]), int(step))
+        for event in usable_events
+        for step in event["window_steps"]
+    }
     timestep_vectors, task_means, task_counts, _manifest, load_counters = _load_timestep_vectors(
         topk_run_dir,
         step_mapping=step_mapping,
         episode_to_task_id=episode_to_task_id,
         task_id_set=task_id_set,
         dict_size=dict_size,
+        required_timestep_keys=required_timestep_keys,
     )
 
     # ---- score per event ----
@@ -694,7 +897,10 @@ def score_cluster_features(
             "topk_run_dir": str(topk_run_dir),
             "event_features_path": str(event_features_path),
             "cluster_assignments_path": str(cluster_assignments_path),
-            "cluster_annotations_path": str(cluster_annotations_path),
+            "cluster_annotations_path": (
+                str(cluster_annotations_path) if cluster_annotations_path is not None else None
+            ),
+            "clusters_path": str(clusters_path) if clusters_path is not None else None,
             "dict_size": dict_size,
             "topk": int(manifest["topk"]),
             "layer": manifest.get("layer"),
@@ -741,7 +947,11 @@ def score_cluster_features(
         "matrix": matrix_raw,
         "row_results": row_results,
     }
-    torch.save(payload, output_path)
+    # A disconnected terminal or full ephemeral disk must not leave a partial
+    # artifact that looks complete to the resumable orchestrator.
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    torch.save(payload, temporary_path)
+    temporary_path.replace(output_path)
     return {
         "output_path": str(output_path),
         "num_rows": num_rows,

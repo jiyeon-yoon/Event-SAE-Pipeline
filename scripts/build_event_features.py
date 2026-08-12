@@ -28,6 +28,11 @@ def main() -> None:
         default="google/siglip-base-patch16-224",
         help="Frozen vision encoder",
     )
+    parser.add_argument(
+        "--vision-model-revision",
+        default=None,
+        help="Optional immutable Hugging Face commit for the vision encoder.",
+    )
     parser.add_argument("--device", default=None, help="Torch device (default: cuda if available)")
     parser.add_argument(
         "--frame-positions",
@@ -49,6 +54,7 @@ def main() -> None:
         samples_path=samples_path,
         output_path=output_path,
         vision_model_name_or_path=args.vision_model_name_or_path,
+        vision_model_revision=args.vision_model_revision,
         device=args.device,
         frame_positions=list(args.frame_positions),
     )

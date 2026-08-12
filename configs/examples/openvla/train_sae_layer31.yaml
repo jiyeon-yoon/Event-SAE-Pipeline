@@ -11,8 +11,9 @@ activation_dim: 4096
 dict_size: 32768
 k: 64
 
-lr: 1.0e-4
-steps: 15000     # paper Table tab:hparams-sae: 15k for OpenVLA
+# Event-SAE paper OpenVLA setting (Appendix): 4k steps, lr=5e-5.
+lr: 5.0e-5
+steps: 4000
 batch_size: 40000
 
 run_tag: libero_spatial

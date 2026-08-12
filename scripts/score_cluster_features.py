@@ -27,7 +27,19 @@ def main() -> None:
     )
     parser.add_argument("--event-features-path", required=True, help="Path to event_features.jsonl")
     parser.add_argument("--cluster-assignments-path", required=True, help="Path to cluster_assignments.jsonl")
-    parser.add_argument("--cluster-annotations-path", required=True, help="Path to cluster_annotations.jsonl")
+    parser.add_argument(
+        "--clusters-path",
+        default=None,
+        help=(
+            "Path to authoritative clusters.jsonl. Recommended: this prevents a failed "
+            "descriptive VLM annotation from removing a cluster from ranking."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-annotations-path",
+        default=None,
+        help="Optional descriptive cluster_annotations.jsonl (phrase/phase labels).",
+    )
     parser.add_argument(
         "--prompt-records-path",
         default=None,
@@ -53,12 +65,17 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.clusters_path is None and args.cluster_annotations_path is None:
+        parser.error("provide --clusters-path and/or --cluster-annotations-path")
 
     summary = score_cluster_features(
         topk_run_dir=Path(args.topk_run_dir),
         event_features_path=Path(args.event_features_path),
         cluster_assignments_path=Path(args.cluster_assignments_path),
-        cluster_annotations_path=Path(args.cluster_annotations_path),
+        cluster_annotations_path=(
+            Path(args.cluster_annotations_path) if args.cluster_annotations_path else None
+        ),
+        clusters_path=Path(args.clusters_path) if args.clusters_path else None,
         output_path=Path(args.output_path),
         window_size=args.window_size,
         top_n=args.top_n,

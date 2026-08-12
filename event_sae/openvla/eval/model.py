@@ -16,6 +16,11 @@ ACTION_DIM = 7
 
 
 def load_model(cfg: Any):
+    revision_kwargs = {}
+    if cfg.model.revision:
+        revision_kwargs["revision"] = cfg.model.revision
+    if cfg.model.code_revision:
+        revision_kwargs["code_revision"] = cfg.model.code_revision
     # Try flash_attention_2 first; fall back to sdpa if unavailable or incompatible.
     try:
         import flash_attn  # noqa: F401
@@ -28,6 +33,7 @@ def load_model(cfg: Any):
                 load_in_4bit=cfg.model.load_in_4bit,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
+                **revision_kwargs,
             )
             print("Successfully loaded model with flash_attention_2")
         except (ValueError, RuntimeError, ImportError) as e:
@@ -40,6 +46,7 @@ def load_model(cfg: Any):
                 load_in_4bit=cfg.model.load_in_4bit,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
+                **revision_kwargs,
             )
     except ImportError:
         print("Warning: flash-attn not available, using sdpa attention")
@@ -51,6 +58,7 @@ def load_model(cfg: Any):
             load_in_4bit=cfg.model.load_in_4bit,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
+            **revision_kwargs,
         )
     if not cfg.model.load_in_8bit and not cfg.model.load_in_4bit:
         model = model.to(DEVICE)
@@ -74,7 +82,14 @@ def load_model(cfg: Any):
 
 
 def get_processor(cfg: Any):
-    return AutoProcessor.from_pretrained(cfg.model.checkpoint, trust_remote_code=True)
+    kwargs = {}
+    if cfg.model.revision:
+        kwargs["revision"] = cfg.model.revision
+    if cfg.model.code_revision:
+        kwargs["code_revision"] = cfg.model.code_revision
+    return AutoProcessor.from_pretrained(
+        cfg.model.checkpoint, trust_remote_code=True, **kwargs
+    )
 
 
 def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.Tensor:

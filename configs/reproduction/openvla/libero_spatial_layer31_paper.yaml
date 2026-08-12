@@ -1,0 +1,14 @@
+# Event-SAE paper reproduction: OpenVLA, LIBERO-Spatial, layer 31.
+# Override data_dir with the merged activation directory at runtime.
+data_dir: /workspace/data/libero-spatial-500/sae_activations/post_mlp_residual
+layer_idx: 31
+activation_dim: 4096
+dict_size: 32768
+k: 64
+lr: 5.0e-5
+steps: 4000
+batch_size: 40000
+run_tag: libero_spatial
+submodule_name: post_mlp_residual
+wandb_project: ""
+wandb_group: ""

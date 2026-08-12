@@ -151,6 +151,25 @@ SAE_CKPT=logs/openvla/sae/libero_spatial_layer31/trainer_0/ae.pt
 All subsequent commands in this doc reference `--sae-checkpoint
 $SAE_CKPT`.
 
+### (b2) Evaluate offline SAE fidelity
+
+This is an offline pass over existing dense shards; it does not run OpenVLA or
+create new rollouts. The command reports global FVE, alive-feature percentage,
+element-wise reconstruction MSE, and average L0. Omit `--max-rows` for the
+final full-shard result.
+
+```bash
+python scripts/evaluate_sae.py \
+    --data-dir logs/openvla/$EVAL_RUN/sae_activations/post_mlp_residual \
+    --sae-checkpoint "$SAE_CKPT" \
+    --output logs/openvla/sae/libero_spatial_layer31/offline_fidelity.json \
+    --device cuda:0
+```
+
+The final checkpoint already operates at the raw activation scale. Do not
+divide evaluation shards by the training norm factor again. If the same
+shards were used for training, the result is in-sample fidelity.
+
 ## Phase 2 — Kinematic keyframe extraction
 
 Pick a small number of waypoints per episode from the end-effector
@@ -339,35 +358,37 @@ preserved.
 
 ### (k) Run a single-feature intervention on LIBERO
 
-Run a closed-loop LIBERO eval with the residual-preserving hook
-applied at the SAE's layer. Repeat the command once per `feature_id`
-in `candidates.jsonl` — extract them with
-`jq -r '.feature_id' candidates.jsonl`. Requires GPU.
+The paper's main OpenVLA intervention sweep reuses the Section 4.1 budget:
+50 trials per task, or 500 rollouts per feature across the 10-task suite.
+Run a no-hook baseline under the same config,
+deduplicate feature IDs across the four rankings, and resume completed features
+rather than launching the flat 20-row candidate list blindly.
+
+For one manually selected feature, the validated low-level command is:
 
 ```bash
 python scripts/openvla/intervene.py \
-    --config configs/examples/openvla/collect_libero_spatial.yaml \
+    --config configs/reproduction/openvla/libero_spatial_intervention_layer31.yaml \
     --sae-checkpoint $SAE_CKPT \
     --layer-idx 31 \
     --feature-id <FEATURE_ID> \
-    --alpha 0.0
+    --alpha 0.0 \
+    --expected-rollouts 500 \
+    --expected-code-revision $EVENT_SAE_COMMIT \
+    --result-output logs/openvla/intervention/feature-<FEATURE_ID>.json
 ```
 
-Add one no-hook baseline:
-
-```bash
-python scripts/openvla/collect_activations.py \
-    --config configs/examples/openvla/collect_libero_spatial.yaml \
-    --override sae_collect.enabled=false
-```
+For the baseline + deduplicated sweep, use
+`scripts/openvla/run_intervention_sweep.py`; the exact command is in
+[reproduce_libero_spatial_500.md](reproduce_libero_spatial_500.md).
 
 For each ranking, take the mean of `SR_hook − SR_baseline` across
 its K features — this is how much zeroing that ranking's features
 hurts the policy.
 
-Each intervention run also writes
-`intervene_feat<N>_alpha<A>_records.jsonl` (per-step feature
-activation before / after the edit) for verifying the hook fired.
+Each intervention result records aggregate hook counts and feature activity.
+Its JSONL evidence file contains one lightweight row per environment step;
+offline fidelity remains the source for numerical reconstruction metrics.
 
 ## Frozen environment snapshot
 

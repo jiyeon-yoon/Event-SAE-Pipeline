@@ -35,6 +35,7 @@ from event_sae.openvla.eval.logging_utils import (
     write_csv_header,
 )
 from event_sae.openvla.eval.model import get_action, get_processor, load_model
+from event_sae.openvla.intervene import SAEHookError
 from event_sae.openvla.eval.utils import (
     get_resize_size,
     invert_gripper_action,
@@ -263,6 +264,10 @@ def eval_libero(
                         break
                     t += 1
 
+                except SAEHookError as exc:
+                    log_file.write(f"Fatal SAE hook error: {exc}\n")
+                    log_file.flush()
+                    raise
                 except Exception as exc:
                     print(f"Caught exception: {exc}")
                     log_file.write(f"Caught exception: {exc}\n")

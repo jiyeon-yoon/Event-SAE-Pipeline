@@ -19,6 +19,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Task-local agglomerative clustering of event features.")
     parser.add_argument("--event-features-path", required=True, help="Path to event_features.jsonl")
     parser.add_argument(
+        "--prompt-records-path",
+        default=None,
+        help=(
+            "Optional collection prompt_records.jsonl. When provided, recurring-event "
+            "coverage uses every attempted task episode."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
         help="Output directory (default: 'clusters/' next to event_features.jsonl)",
@@ -41,6 +49,9 @@ def main() -> None:
     summary = cluster_events(
         event_features_path=event_features_path,
         output_dir=output_dir,
+        prompt_records_path=(
+            Path(args.prompt_records_path).resolve() if args.prompt_records_path else None
+        ),
         vision_weight=args.vision_weight,
         state_weight=args.state_weight,
         progress_weight=args.progress_weight,

@@ -13,6 +13,8 @@ import yaml
 class ModelConfig:
     family: str = "openvla"
     checkpoint: str = "openvla/openvla-7b-finetuned-libero-10"
+    revision: str = ""  # Empty follows Hub HEAD; set a commit hash to pin it.
+    code_revision: str = ""  # Separate trust_remote_code commit (often the base OpenVLA repo).
     load_in_8bit: bool = False
     load_in_4bit: bool = False
     center_crop: bool = True

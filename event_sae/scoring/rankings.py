@@ -277,7 +277,8 @@ def alive_feature_ids(topk_run_dir: Path) -> set[int]:
     manifest = _load_manifest(topk_run_dir)
     alive: set[int] = set()
     for payload in _iter_shards(topk_run_dir, manifest, desc="alive scan"):
-        ids = payload["top_feature_ids"].to(dtype=torch.int64).reshape(-1).tolist()
+        values = payload["top_feature_vals"]
+        ids = payload["top_feature_ids"].to(dtype=torch.int64)[values > 0].tolist()
         alive.update(ids)
     return alive
 

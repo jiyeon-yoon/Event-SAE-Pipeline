@@ -1,0 +1,22 @@
+# Event-SAE Section 4.3 main Spatial intervention: 50 rollouts per task.
+model:
+  checkpoint: openvla/openvla-7b-finetuned-libero-spatial
+  revision: 962318cec55ac10993ff0f5f43eda9a270b4c873
+  code_revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f
+  center_crop: true
+
+env:
+  task_suite_name: libero_spatial
+  num_trials_per_task: 50
+  task_ids: ""
+  seed: 0
+
+logging:
+  root_dir: /workspace/results/intervention
+  save_video: false
+  save_actions: false
+  save_prompt_records: true
+  save_trajectory_records: false
+
+sae_collect:
+  enabled: false

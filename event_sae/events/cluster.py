@@ -103,6 +103,7 @@ def cluster_events(
     event_features_path: Path,
     output_dir: Path,
     *,
+    prompt_records_path: Path | None = None,
     vision_weight: float = 1.0,
     state_weight: float = 0.5,
     progress_weight: float = 0.4,
@@ -127,6 +128,19 @@ def cluster_events(
     by_task: dict[str, list[dict]] = defaultdict(list)
     for record in records:
         by_task[record["task_description"]].append(record)
+
+    # Paper coverage is relative to every attempted rollout for the task,
+    # including a rollout where AWE yielded no usable event. Preserve the
+    # historical event-only denominator when prompt_records is omitted.
+    attempted_episodes_by_task: dict[str, set[int]] = defaultdict(set)
+    if prompt_records_path is not None:
+        prompt_records_path = Path(prompt_records_path).resolve()
+        if not prompt_records_path.is_file():
+            raise FileNotFoundError(f"prompt_records.jsonl not found: {prompt_records_path}")
+        for prompt in load_jsonl(prompt_records_path):
+            attempted_episodes_by_task[str(prompt["task_description"])].add(
+                int(prompt["episode_num"])
+            )
 
     assignments: list[dict] = []
     cluster_summaries: list[dict] = []
@@ -157,7 +171,9 @@ def cluster_events(
             labels = clustering.fit_predict(task_vectors)
 
         task_slug = _slugify(task_description)
-        total_episodes = len({int(record["episode_num"]) for record in task_records})
+        event_episode_nums = {int(record["episode_num"]) for record in task_records}
+        attempted_episode_nums = attempted_episodes_by_task.get(task_description)
+        total_episodes = len(attempted_episode_nums or event_episode_nums)
         member_ids_by_label: dict[int, list[int]] = defaultdict(list)
         for idx, label in enumerate(labels):
             member_ids_by_label[int(label)].append(idx)
@@ -212,9 +228,18 @@ def cluster_events(
     write_jsonl(output_dir / "clusters.jsonl", cluster_summaries)
     summary = {
         "event_features_path": str(event_features_path),
+        "prompt_records_path": (
+            str(prompt_records_path) if prompt_records_path is not None else None
+        ),
+        "coverage_denominator": (
+            "all_attempted_episodes" if prompt_records_path is not None else "event_episodes_only"
+        ),
         "num_events": len(records),
         "num_tasks": len(by_task),
         "num_clusters": len(cluster_summaries),
+        "num_recurring_clusters": sum(
+            1 for cluster in cluster_summaries if cluster["is_canonical"]
+        ),
         "vision_weight": float(vision_weight),
         "state_weight": float(state_weight),
         "progress_weight": float(progress_weight),
