@@ -140,5 +140,42 @@ def test_feature_intervention_preserves_residual_and_reports_activity(
     assert summary["num_forwards"] == 1
     assert summary["active_feature_values"] == 2
     assert summary["max_feature_activation"] == 1.0
+    assert summary["post_intervention_active_feature_values"] == 0
+    assert summary["post_intervention_max_feature_activation"] == 0.0
+    assert summary["absolute_feature_delta"] == 2.0
     handle.remove()
+    handle.remove()
+
+
+def test_feature_intervention_alpha_one_is_an_identity(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        intervene,
+        "load_batch_topk_sae",
+        lambda checkpoint_path, device: (_FeatureSAE(), _checkpoint_config()),
+    )
+    model = _model()
+    model._sae_hook_context = {
+        "episode_num": 1,
+        "task_id": 0,
+        "task_episode_idx": 0,
+        "step_in_episode": 3,
+    }
+    handle = intervene.apply_resid_post_feature_perturb_hook(
+        model=model,
+        layer_idx=1,
+        sae_checkpoint_path="unused.pt",
+        feature_idx=2,
+        alpha=1.0,
+        hook_start_step=0,
+        run_dir=str(tmp_path),
+        log_file=io.StringIO(),
+    )
+    source = torch.zeros(1, 2, 4)
+    unhooked_expected = torch.ones_like(source)
+    hooked = model.language_model.model.layers[1](source)[0]
+    torch.testing.assert_close(hooked, unhooked_expected)
+    summary = handle.summary()
+    assert summary["active_feature_values"] == 2
+    assert summary["post_intervention_active_feature_values"] == 2
+    assert summary["absolute_feature_delta"] == 0.0
     handle.remove()

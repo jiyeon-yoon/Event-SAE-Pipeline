@@ -100,6 +100,9 @@ class InterventionHookHandle:
     def summary(self) -> dict:
         active = self._stats.get("active_values")
         maximum = self._stats.get("max_activation")
+        post_active = self._stats.get("post_active_values")
+        post_maximum = self._stats.get("post_max_activation")
+        absolute_delta = self._stats.get("absolute_feature_delta")
         return {
             "feature_id": self.feature_idx,
             "alpha": self.alpha,
@@ -108,6 +111,15 @@ class InterventionHookHandle:
             "num_tokens": int(self._stats["num_tokens"]),
             "active_feature_values": int(active.item()) if active is not None else 0,
             "max_feature_activation": float(maximum.item()) if maximum is not None else 0.0,
+            "post_intervention_active_feature_values": (
+                int(post_active.item()) if post_active is not None else 0
+            ),
+            "post_intervention_max_feature_activation": (
+                float(post_maximum.item()) if post_maximum is not None else 0.0
+            ),
+            "absolute_feature_delta": (
+                float(absolute_delta.item()) if absolute_delta is not None else 0.0
+            ),
         }
 
     def remove(self) -> None:
@@ -238,6 +250,9 @@ def apply_resid_post_feature_perturb_hook(
         "num_tokens": 0,
         "active_values": None,
         "max_activation": None,
+        "post_active_values": None,
+        "post_max_activation": None,
+        "absolute_feature_delta": None,
     }
     last_environment_step = {"value": None}
 
@@ -267,12 +282,16 @@ def apply_resid_post_feature_perturb_hook(
             perturbed = encoded.clone()
             feature_before = encoded[:, feature_idx]
             perturbed[:, feature_idx] = feature_before * float(alpha)
+            feature_after = perturbed[:, feature_idx]
             updated = flat + (sae.decode(perturbed) - sae.decode(encoded))
 
             stats["num_forwards"] += 1
             stats["num_tokens"] += int(encoded.shape[0])
             active = torch.count_nonzero(feature_before)
             maximum = feature_before.max()
+            post_active = torch.count_nonzero(feature_after)
+            post_maximum = feature_after.max()
+            absolute_delta = torch.sum(torch.abs(feature_after - feature_before))
             stats["active_values"] = (
                 active if stats["active_values"] is None else stats["active_values"] + active
             )
@@ -280,6 +299,21 @@ def apply_resid_post_feature_perturb_hook(
                 maximum
                 if stats["max_activation"] is None
                 else torch.maximum(stats["max_activation"], maximum)
+            )
+            stats["post_active_values"] = (
+                post_active
+                if stats["post_active_values"] is None
+                else stats["post_active_values"] + post_active
+            )
+            stats["post_max_activation"] = (
+                post_maximum
+                if stats["post_max_activation"] is None
+                else torch.maximum(stats["post_max_activation"], post_maximum)
+            )
+            stats["absolute_feature_delta"] = (
+                absolute_delta
+                if stats["absolute_feature_delta"] is None
+                else stats["absolute_feature_delta"] + absolute_delta
             )
 
             environment_step = (episode_num, step_in_episode)

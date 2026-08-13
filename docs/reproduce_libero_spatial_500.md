@@ -41,15 +41,15 @@ EVENT_SAE_COMMIT=GITHUB에_PUSH한_40자리_COMMIT
 test "${#EVENT_SAE_COMMIT}" -eq 40 || { echo "COMMIT_REQUIRED"; exit 1; }
 
 cd /workspace
-test -d Event-SAE-pipeline/.git || \
-  git clone https://github.com/jiyeon-yoon/Event-SAE.git Event-SAE-pipeline
-test -z "$(git -C Event-SAE-pipeline status --porcelain)" || \
+test -d Event-SAE-Pipeline/.git || \
+  git clone https://github.com/jiyeon-yoon/Event-SAE-Pipeline.git Event-SAE-Pipeline
+test -z "$(git -C Event-SAE-Pipeline status --porcelain)" || \
   { echo "DIRTY_SOURCE"; exit 1; }
-git -C Event-SAE-pipeline fetch origin main
-git -C Event-SAE-pipeline checkout --detach "$EVENT_SAE_COMMIT"
-test "$(git -C Event-SAE-pipeline rev-parse HEAD)" = "$EVENT_SAE_COMMIT" || exit 1
+git -C Event-SAE-Pipeline fetch origin main
+git -C Event-SAE-Pipeline checkout --detach "$EVENT_SAE_COMMIT"
+test "$(git -C Event-SAE-Pipeline rev-parse HEAD)" = "$EVENT_SAE_COMMIT" || exit 1
 
-cd /workspace/Event-SAE-pipeline
+cd /workspace/Event-SAE-Pipeline
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 git rev-parse HEAD
 PYTHONPATH=. pytest -q
@@ -63,7 +63,7 @@ PYTHONPATH=. pytest -q
 공개 Hugging Face 저장소이므로 다운로드에는 token이 필요 없다.
 
 ```bash
-cd /workspace/Event-SAE-pipeline
+cd /workspace/Event-SAE-Pipeline
 python scripts/openvla/download_libero_spatial_reproduction_inputs.py \
   --output-root /workspace/event-sae-spatial-inputs
 ```
@@ -79,7 +79,7 @@ activation_shards: 369
 ## 2. Discovery pipeline 실행
 
 ```bash
-cd /workspace/Event-SAE-pipeline
+cd /workspace/Event-SAE-Pipeline
 python scripts/openvla/reproduce_libero_spatial_500.py \
   --input-root /workspace/event-sae-spatial-inputs \
   --work-dir /workspace/event-sae-spatial-repro \
@@ -141,7 +141,7 @@ cluster·ranking 결과만 올린다.
 재사용하는 방법은 빠른 탐색용일 뿐 정확한 비교로 취급하지 않는다.
 
 ```bash
-cd /workspace/Event-SAE-pipeline
+cd /workspace/Event-SAE-Pipeline
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p /workspace/event-sae-spatial-repro/hooked-sr/runs
 
@@ -177,7 +177,60 @@ python scripts/openvla/upload_reproduction_results.py \
 
 `REMOTE_HOOKED_SR_OK`가 완료 기준이다.
 
-## 5. Intervention
+## 5. Intervention 개발 검증
+
+논문 규모의 전체 sweep 전에 구현만 검증하려면 아래 축소 실험을 실행한다. 기존
+전체 Intervention 코드와 결과 경로는 사용하거나 삭제하지 않는다.
+
+- 조건: Raw, event rank-1 `alpha=1`, 같은 event feature `alpha=0`, random rank-1 `alpha=0`
+- 조건별: 10 tasks × 5 trials = 50 rollouts
+- 전체: 200 rollouts
+- 동일 task/trial의 LIBERO initial-state 배열 SHA256을 네 조건에서 직접 비교
+- Raw와 `alpha=1`의 action·성공 결과가 같아야 함
+- `alpha=0`은 target feature의 개입 후 nonzero 수가 0이어야 함
+- Raw 대비 action 변화와 조건별·task별 SR은 결과 JSON에 기록
+
+이 실험은 구현 검증이며 논문 Table 3의 통계적 재현 결과로 사용하지 않는다. 현재
+실측 속도 기준 약 2~4시간을 예상한다.
+
+```bash
+cd /workspace/Event-SAE-Pipeline
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+
+python scripts/openvla/run_intervention_development_validation.py \
+  --config configs/reproduction/openvla/libero_spatial_intervention_development_validation_layer31.yaml \
+  --candidates /workspace/event-sae-spatial-repro/pipeline/rankings/candidates.jsonl \
+  --sae-checkpoint /workspace/event-sae-spatial-inputs/checkpoint/trainer_0/ae.pt \
+  --work-dir /workspace/event-sae-spatial-repro \
+  --expected-code-revision "$EVENT_SAE_COMMIT"
+```
+
+완료 기준:
+
+```text
+INTERVENTION_DEVELOPMENT_VALIDATION_OK
+```
+
+핵심 결과는 아래 파일 한 개에서 확인한다.
+
+```text
+/workspace/event-sae-spatial-repro/intervention-development-validation/development_validation_summary.json
+```
+
+`passed=true`, `identical_initial_states=true`,
+`alpha1_identity_actions_and_outcomes=true`, 두 `feature_zeroed=true`를 확인한다.
+`action_change_observed`는 실제 행동 변화 관측값이며 구현 통과 조건과 분리된다.
+
+```bash
+python scripts/openvla/upload_reproduction_results.py \
+  --work-dir /workspace/event-sae-spatial-repro \
+  --repo-id "$HF_RESULTS_REPO" \
+  --section intervention-development-validation
+```
+
+업로드 완료 기준은 `REMOTE_INTERVENTION_DEVELOPMENT_VALIDATION_OK`다.
+
+## 6. 논문 규모의 전체 Intervention
 
 `candidates.jsonl`은 ranking 4종 × 5개로 20행이지만 feature ID가 서로 겹칠 수
 있다. 동일 feature는 한 번만 실행하고 결과를 ranking 간 공유해야 한다.

@@ -7,6 +7,7 @@ Single-feature / zero-out interventions are not built in; supply them as an
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -50,12 +51,24 @@ class EvalResult:
     success_rate: float
     prompt_records_path: str | None = None
     trajectory_records_path: str | None = None
+    episode_results_path: str | None = None
 
 
 def _parse_layer_idxs(raw: str | int) -> List[int]:
     if isinstance(raw, int):
         return [raw]
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def _initial_state_sha256(value) -> str:
+    """Hash the exact LIBERO initial-state array used for a rollout."""
+
+    array = np.ascontiguousarray(np.asarray(value))
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("utf-8"))
+    digest.update(json.dumps(array.shape).encode("utf-8"))
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 _MAX_STEPS_PER_SUITE = {
@@ -102,6 +115,12 @@ def eval_libero(
     if cfg.logging.save_trajectory_records:
         trajectory_records_path = os.path.join(run_dir, "trajectory_records.jsonl")
         trajectory_records_file = open(trajectory_records_path, "w", encoding="utf-8")
+
+    # Always write one compact row per rollout. Paired policy conditions can
+    # then prove that they used the same exact LIBERO initial state and compare
+    # outcomes without parsing human-readable stdout.
+    episode_results_path = os.path.join(run_dir, "episode_results.jsonl")
+    episode_results_file = open(episode_results_path, "w", encoding="utf-8")
 
     hooks: List[object] = []
     if cfg.sae_collect.enabled:
@@ -168,6 +187,8 @@ def eval_libero(
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(cfg.env.num_trials_per_task)):
             episode_num = total_episodes + 1
+            initial_state = initial_states[episode_idx]
+            initial_state_sha256 = _initial_state_sha256(initial_state)
             if prompt_records_file is not None:
                 prompt_records_file.write(
                     json.dumps(
@@ -176,6 +197,7 @@ def eval_libero(
                             "task_id": task_id,
                             "task_episode_idx": episode_idx,
                             "task_description": task_description,
+                            "initial_state_sha256": initial_state_sha256,
                         }
                     )
                     + "\n"
@@ -185,11 +207,12 @@ def eval_libero(
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
             env.reset()
-            obs = env.set_init_state(initial_states[episode_idx])
+            obs = env.set_init_state(initial_state)
 
             t = 0
             done = False
             replay_images = []
+            caught_exception: str | None = None
 
             print(f"Starting episode {task_episodes + 1}...")
             log_file.write(f"Starting episode {task_episodes + 1}...\n")
@@ -271,6 +294,7 @@ def eval_libero(
                 except Exception as exc:
                     print(f"Caught exception: {exc}")
                     log_file.write(f"Caught exception: {exc}\n")
+                    caught_exception = repr(exc)
                     break
 
             task_episodes += 1
@@ -289,6 +313,23 @@ def eval_libero(
                     out_dir=os.path.join(run_dir, "videos"),
                     log_file=log_file,
                 )
+
+            episode_results_file.write(
+                json.dumps(
+                    {
+                        "episode_num": episode_num,
+                        "task_id": task_id,
+                        "task_episode_idx": episode_idx,
+                        "task_description": task_description,
+                        "initial_state_sha256": initial_state_sha256,
+                        "success": bool(done),
+                        "num_actions": len(current_episode_actions),
+                        "caught_exception": caught_exception,
+                    }
+                )
+                + "\n"
+            )
+            episode_results_file.flush()
 
             print(f"Success: {done}")
             print(f"# episodes completed so far: {total_episodes}")
@@ -316,10 +357,12 @@ def eval_libero(
         prompt_records_file.close()
     if trajectory_records_file is not None:
         trajectory_records_file.close()
+    episode_results_file.close()
     log_file.close()
     return EvalResult(
         run_dir=run_dir,
         success_rate=float(total_successes) / float(total_episodes),
         prompt_records_path=prompt_records_path,
         trajectory_records_path=trajectory_records_path,
+        episode_results_path=episode_results_path,
     )

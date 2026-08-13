@@ -50,7 +50,12 @@ def main() -> None:
     parser.add_argument("--repo-id", required=True)
     parser.add_argument(
         "--section",
-        choices=("discovery", "hooked-sr", "intervention"),
+        choices=(
+            "discovery",
+            "hooked-sr",
+            "intervention",
+            "intervention-development-validation",
+        ),
         default="discovery",
     )
     parser.add_argument("--private", action="store_true")
