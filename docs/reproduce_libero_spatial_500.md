@@ -8,6 +8,21 @@
 
 새 activation 수집과 SAE 재학습은 하지 않는다.
 
+## 현재 개발 범위
+
+LIBERO-Spatial 범위의 baseline 소스 파이프라인은 구현되었다. Offline
+fidelity, AWE keyframe, event clustering/ranking, Hooked SR, feature
+intervention 실행·검증·업로드 경로를 포함한다.
+
+다만 이 문서는 **LIBERO-Spatial baseline 개발**의 Runbook이다. Gemini
+annotation과 intervention 소스 경로는 구현되었지만, 실제 실행은 Gemini
+annotation을 생략했고 intervention은 GPU 비용을 고려한 개발 검증까지
+수행했다. 나머지 3개 LIBERO suite와 논문 규모의 전체 intervention
+sweep은 실행하지 않았다.
+
+정밀한 실패·subgoal 연구를 위한 새로운 확장 데이터 수집은
+[`collect_extended_libero.md`](collect_extended_libero.md)의 독립 수집기를 사용한다.
+
 ## 실행 범위
 
 ```text

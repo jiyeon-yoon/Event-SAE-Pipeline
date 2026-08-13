@@ -1,0 +1,38 @@
+# New research dataset collector. This does not call or modify the original
+# scripts/openvla/collect_activations.py rollout runner.
+model:
+  family: openvla
+  checkpoint: openvla/openvla-7b-finetuned-libero-spatial
+  revision: 962318cec55ac10993ff0f5f43eda9a270b4c873
+  code_revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f
+  load_in_8bit: false
+  load_in_4bit: false
+  center_crop: true
+
+env:
+  task_suite_name: libero_spatial
+  num_steps_wait: 10
+  num_trials_per_task: 50
+  seed: 0
+  task_ids: ""
+  resolution: 256
+
+output:
+  root_dir: /workspace/results/extended-libero
+  save_video: true
+  video_fps: 30
+  save_model_input_rgb: true
+  compress_npz: true
+  flush_jsonl_every_step: true
+
+collection:
+  layer_idx: 31
+  activation_flush_every: 50000
+  save_observation_state: true
+  save_simulator_state: true
+  save_object_and_fixture_state: true
+  save_contacts_and_grasp: true
+  save_goal_predicates: true
+  save_policy_uncertainty: true
+  strict_preflight: true
+  fail_fast: true

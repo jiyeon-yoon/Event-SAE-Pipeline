@@ -1,0 +1,92 @@
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from event_sae.openvla.extended_collection.policy import (  # noqa: E402
+    _summarize_action_scores,
+    infer_action_with_uncertainty,
+)
+
+
+class FakeBatch(dict):
+    def to(self, device, dtype=None):
+        result = FakeBatch()
+        for key, value in self.items():
+            result[key] = value.to(
+                device=device, dtype=dtype if value.is_floating_point() else None
+            )
+        return result
+
+
+class FakeProcessor:
+    def __call__(self, prompt, image):
+        assert image.size == (224, 224)
+        return FakeBatch(
+            input_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            attention_mask=torch.ones((1, 2), dtype=torch.long),
+            pixel_values=torch.zeros((1, 3, 224, 224), dtype=torch.float32),
+        )
+
+
+class FakeModel:
+    vocab_size = 100
+    bin_centers = np.linspace(-0.75, 0.75, 4)
+
+    def parameters(self):
+        yield torch.zeros(1)
+
+    def get_action_dim(self, key):
+        return 7
+
+    def get_action_stats(self, key):
+        return {"q01": np.full(7, -2.0), "q99": np.full(7, 2.0)}
+
+    def generate(self, input_ids, **kwargs):
+        assert int(input_ids[0, -1]) == 29871
+        assert kwargs["max_new_tokens"] == 7
+        ids = torch.tensor([[99, 98, 97, 96, 99, 98, 97]], dtype=torch.long)
+        sequences = torch.cat((input_ids, ids), dim=1)
+        scores = []
+        for token in ids[0]:
+            score = torch.full((1, 104), -8.0)
+            score[0, int(token)] = 4.0
+            scores.append(score)
+        return SimpleNamespace(sequences=sequences, scores=tuple(scores))
+
+
+def test_single_generation_decodes_action_and_drops_logits():
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(center_crop=False, checkpoint="openvla/test")
+    )
+    output = infer_action_with_uncertainty(
+        FakeModel(),
+        FakeProcessor(),
+        cfg,
+        np.zeros((224, 224, 3), dtype=np.uint8),
+        "move object",
+        "libero_spatial",
+    )
+    assert output.raw_action.shape == (7,)
+    assert output.action_token_ids == [99, 98, 97, 96, 99, 98, 97]
+    assert len(output.uncertainty["per_action_dimension"]) == 7
+    assert "logits" not in repr(output.uncertainty).lower()
+    assert output.model_input_rgb.shape == (224, 224, 3)
+
+
+def test_uncertainty_is_over_action_vocabulary_only():
+    scores = (torch.tensor([[1000.0, -2.0, -1.0, 3.0, 2.0]]),)
+    result = _summarize_action_scores(
+        scores, [3], action_vocab_end=5, action_vocab_size=2
+    )
+    row = result["per_action_dimension"][0]
+    assert row["full_next_token"]["top1_token_id"] == 0
+    assert row["conditional_action_token"]["top1_token_id"] == 3
+    assert row["selected_token_conditional_rank"] == 1
+    assert row["conditional_action_token"]["probability_mass_in_full_vocabulary"] < 1e-6
+    assert result["action_vocab_start"] == 3

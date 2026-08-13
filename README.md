@@ -31,9 +31,28 @@ the intervention hook (k) are backbone-specific. Per-backbone guides:
 - **현재 Spatial-500 재현** — [docs/reproduce_libero_spatial_500.md](docs/reproduce_libero_spatial_500.md)
 - **openpi (π₀.₅)** — [docs/openpi.md](docs/openpi.md)
 
-Each guide includes installation, the full pipeline (steps a–k),
+These backbone guides include installation, the full pipeline (steps a–k),
 pretrained SAE checkpoints from the paper (on the Hugging Face Hub),
 and a reproducibility check against the original research artifacts.
+
+Post-baseline research collector:
+
+- **실패·subgoal 연구용 독립 확장 수집기** —
+  [docs/collect_extended_libero.md](docs/collect_extended_libero.md)
+
+## Current project scope
+
+- The **LIBERO-Spatial Event-SAE baseline source pipeline is implemented**:
+  offline fidelity, AWE keyframes, event clustering/ranking, Hooked SR, and
+  feature intervention.
+- Discovery and Hooked SR have full execution paths; intervention has a
+  separate development-validation protocol before the expensive full sweep.
+- The Gemini annotation and intervention source paths are implemented. Actual
+  execution currently covers LIBERO-Spatial; Gemini annotation was omitted,
+  and intervention was limited to development validation because of GPU cost.
+  The other three LIBERO suites and the full intervention sweep were not run.
+- The new rich-data collector is independent research code. It does not modify
+  or call the original Event-SAE activation collector.
 
 ## Repository layout
 
@@ -54,6 +73,7 @@ event_sae/                     core library
     rankings.py                four ranking strategies (j)
   evaluate.py                  offline SAE fidelity (FVE, MSE, alive, L0)
   openvla/                     openVLA backbone: collection (a) + intervention (k)
+    extended_collection/       independent rich LIBERO research collector
   openpi/                      openpi backbone: collection (a) + intervention (k)
 scripts/                       CLI entry points, one per step
   train_sae.py                          (b)
@@ -67,9 +87,14 @@ scripts/                       CLI entry points, one per step
   score_cluster_features.py             (i)
   build_feature_rankings.py             (j)
   openvla/{collect_activations,intervene}.py   (a, k — openVLA)
+  openvla/collect_extended_dataset.py          rich-data collection
+  openvla/validate_extended_dataset.py         rich-data validation
+  openvla/verify_extended_dataset_upload.py    remote upload validation
   openpi/{serve_policy,eval_libero}.py         (a, k — openpi)
 configs/examples/{openvla,openpi}/   example YAML configs
+configs/research/openvla/             rich-data collection config
 docs/{openvla,openpi}.md             per-backbone runbooks
+docs/collect_extended_libero.md       rich-data collection runbook
 environment-openvla.yml              conda env (openVLA)
 environment-{openvla,openpi}.lock.yml  pinned snapshots
 ```
