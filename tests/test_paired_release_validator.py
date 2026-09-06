@@ -18,7 +18,7 @@ from event_sae.openvla.extended_collection.writer import ExtendedRunWriter
 PAIR_ID = "libero_spatial-task00-trial000-seed0"
 
 
-def _state(grasped: bool):
+def _state(grasped: bool, *, goal_satisfied: bool = False):
     return {
         "robot": {
             "joint_position": [0.0],
@@ -45,7 +45,8 @@ def _state(grasped: bool):
             "grasped_objects": {"bowl": grasped},
         },
         "goals": {
-            "goal_predicates": [{"satisfied": False, "error": None}],
+            "goal_predicates": [{"satisfied": goal_satisfied, "error": None}],
+            "all_goal_predicates_satisfied": goal_satisfied,
         },
     }
 
@@ -80,7 +81,7 @@ def _uncertainty():
     }
 
 
-def _build_run(tmp_path: Path) -> Path:
+def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
     run_dir = tmp_path / "paired"
     initial = np.asarray([1.0, 2.0], dtype=np.float32)
     vectors = {
@@ -89,27 +90,30 @@ def _build_run(tmp_path: Path) -> Path:
     }
     policy_action = np.asarray([0.1, 0, 0, 0, 0, 0, 1.0])
     manifest = {
-                "schema_version": "extended_openvla_libero_paired_release_v2",
-                "collection_status": "complete",
-                "activation_stream": {"layer": 31, "forwards_per_policy_step": 7},
-                "policy_uncertainty": {"full_logits_stored": False},
-                "resolved_task_ids": [0],
-                "config": {
-                    "env": {"num_trials_per_task": 1},
-                    "output": {
-                        "save_model_input_rgb": True,
-                        "save_video": False,
-                    },
-                    "paired_release": {
-                        "action_atol": 1e-6,
-                        "state_atol": 1e-6,
-                        "max_force_open_steps": 20,
-                        "stable_detach_steps": 1,
-                        "target_valid_pairs_per_task": 1,
-                        "target_primary_pairs_per_task": 0,
-                    },
-                },
-            }
+        "schema_version": "extended_openvla_libero_paired_release_v3",
+        "collection_status": "complete",
+        "activation_stream": {"layer": 31, "forwards_per_policy_step": 7},
+        "policy_uncertainty": {"full_logits_stored": False},
+        "resolved_task_ids": [0],
+        "config": {
+            "env": {"num_trials_per_task": 1},
+            "output": {
+                "save_model_input_rgb": True,
+                "save_video": False,
+            },
+            "paired_release": {
+                "action_atol": 1e-6,
+                "state_atol": 1e-6,
+                "max_force_open_steps": 20,
+                "stable_detach_steps": 1,
+                "normal_post_success_steps": 20,
+                "post_detach_goal_stable_steps": 2,
+                "forced_gripper_value": -1.0,
+                "target_valid_pairs_per_task": 1,
+                "target_primary_pairs_per_task": int(primary),
+            },
+        },
+    }
     with ExtendedRunWriter(run_dir, enable_pair_results=True) as writer:
         writer.write_manifest(manifest)
         episode_results = {}
@@ -126,13 +130,29 @@ def _build_run(tmp_path: Path) -> Path:
                 prompt_record={**common_identity, "task_description": "move bowl"},
                 initial_state=initial,
             )
-            for step in range(2):
+            for step in range(4):
                 applied = condition == "forced_release" and step == 1
-                executed = policy_action.copy()
+                step_policy_action = policy_action.copy()
+                if condition == "normal" and primary and step >= 2:
+                    step_policy_action[-1] = -1.0
+                executed = step_policy_action.copy()
                 if applied:
                     executed[-1] = -1.0
-                pre = _state(grasped=step == 1)
-                post = _state(grasped=step == 1 and not applied)
+                if condition == "forced_release":
+                    pre_grasped = step == 1
+                    post_grasped = False
+                else:
+                    pre_grasped = step >= 1 and not (primary and step >= 3)
+                    post_grasped = step >= 1 and not (primary and step >= 2)
+                normal_goal = condition == "normal" and primary and step >= 2
+                pre = _state(
+                    grasped=pre_grasped,
+                    goal_satisfied=normal_goal and step >= 3,
+                )
+                post = _state(
+                    grasped=post_grasped,
+                    goal_satisfied=normal_goal,
+                )
                 writer.write_step(
                     common={**common_identity, "step_in_episode": step},
                     pre_json=pre,
@@ -140,7 +160,7 @@ def _build_run(tmp_path: Path) -> Path:
                     pre_vectors=vectors,
                     post_vectors=vectors,
                     raw_action=np.zeros(7),
-                    policy_action=policy_action,
+                    policy_action=step_policy_action,
                     executed_action=executed,
                     intervention={
                         "type": (
@@ -161,11 +181,19 @@ def _build_run(tmp_path: Path) -> Path:
                 "success": condition == "normal",
                 "initial_state_sha256": prompt["initial_state_sha256"],
                 "trigger": {"trigger_step": 1, "initial_object_z": 0.0},
-                "t_cmd": 1 if condition == "forced_release" else None,
-                "t_detach": 1 if condition == "forced_release" else None,
-                "t_detach_confirmed": (
-                    1 if condition == "forced_release" else None
+                "t_cmd": (
+                    1 if condition == "forced_release" else (2 if primary else None)
                 ),
+                "t_detach": (
+                    1 if condition == "forced_release" else (2 if primary else None)
+                ),
+                "t_detach_confirmed": (
+                    1 if condition == "forced_release" else (2 if primary else None)
+                ),
+                "t_goal_stable_after_detach": (
+                    3 if condition == "normal" and primary else None
+                ),
+                "normal_post_success_timeout": False,
                 "t_obs": None,
                 "t_post_detach_destination_contact": None,
                 "invalid_reason": None,
@@ -191,13 +219,16 @@ def _build_run(tmp_path: Path) -> Path:
                 "target_object": "bowl",
                 "initial_state_sha256": next(
                     json.loads(line)["initial_state_sha256"]
-                    for line in (run_dir / "prompt_records.jsonl").read_text().splitlines()
+                    for line in (run_dir / "prompt_records.jsonl")
+                    .read_text()
+                    .splitlines()
                 ),
                 "normal_episode_num": 1,
                 "forced_episode_num": 2,
                 "normal_success": True,
-                "normal_natural_release_observed": False,
-                "primary_analysis_eligible": False,
+                "normal_natural_release_observed": primary,
+                "normal_post_detach_goal_stable": primary,
+                "primary_analysis_eligible": primary,
                 "normal": episode_results["normal"],
                 "forced_release": episode_results["forced_release"],
                 "prefix_comparison": {"rgb_exact": True},
@@ -207,11 +238,11 @@ def _build_run(tmp_path: Path) -> Path:
     activation_dir = run_dir / "sae_activations" / "post_mlp_residual"
     activation_dir.mkdir(parents=True)
     shard = "layer_31_shard_000000.pt"
-    torch.save(torch.zeros((28, 4096)), activation_dir / shard)
+    torch.save(torch.zeros((56, 4096)), activation_dir / shard)
     records = []
     offset = 0
     for episode_num, condition in ((1, "normal"), (2, "forced_release")):
-        for step in range(2):
+        for step in range(4):
             for _ in range(7):
                 records.append(
                     {
@@ -238,26 +269,26 @@ def _build_run(tmp_path: Path) -> Path:
         "run_dir": str(run_dir),
         "max_attempts_per_task": 1,
         "target_valid_pairs_per_task": 1,
-        "target_primary_pairs_per_task": 0,
+        "target_primary_pairs_per_task": int(primary),
         "pair_candidates": 1,
         "eligible_pairs": 1,
         "valid_pairs": 1,
         "invalid_pairs": 0,
         "ineligible_pairs": 0,
-        "primary_analysis_pairs": 0,
+        "primary_analysis_pairs": int(primary),
         "per_task": {
             "0": {
                 "task_id": 0,
                 "max_attempts": 1,
                 "target_valid_pairs": 1,
-                "target_primary_pairs": 0,
+                "target_primary_pairs": int(primary),
                 "attempts": 1,
                 "attempts_remaining": 0,
                 "eligible_pairs": 1,
                 "valid_pairs": 1,
                 "invalid_pairs": 0,
                 "ineligible_pairs": 0,
-                "primary_analysis_pairs": 0,
+                "primary_analysis_pairs": int(primary),
                 "target_reached": True,
             }
         },
@@ -287,9 +318,7 @@ def _build_run(tmp_path: Path) -> Path:
         json.dumps(summary, indent=2) + "\n",
         encoding="utf-8",
     )
-    (run_dir / "COLLECTION_COMPLETE").write_text(
-        "done\n", encoding="utf-8"
-    )
+    (run_dir / "COLLECTION_COMPLETE").write_text("done\n", encoding="utf-8")
     return run_dir
 
 
@@ -300,6 +329,34 @@ def test_paired_validator_checks_matched_prefix_and_gripper_only(tmp_path: Path)
     assert summary["valid_pairs"] == 1
     assert summary["ineligible_pairs"] == 0
     assert summary["prefix_metrics"][PAIR_ID]["rgb_exact"] is True
+
+
+def test_paired_validator_accepts_primary_natural_release_and_stable_goal(
+    tmp_path: Path,
+):
+    run_dir = _build_run(tmp_path, primary=True)
+    summary = validate_paired_release_run(run_dir)
+    assert summary["per_task"]["0"]["primary_analysis_pairs"] == 1
+
+
+def test_paired_validator_rejects_forged_post_detach_goal_window(
+    tmp_path: Path,
+):
+    run_dir = _build_run(tmp_path, primary=True)
+    path = run_dir / "trajectory_records.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    row = next(
+        item
+        for item in rows
+        if item["condition"] == "normal" and item["step_in_episode"] == 3
+    )
+    row["post"]["goals"]["all_goal_predicates_satisfied"] = False
+    path.write_text(
+        "".join(json.dumps(item) + "\n" for item in rows),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="post-detach goal window"):
+        validate_paired_release_run(run_dir)
 
 
 def test_paired_validator_can_run_before_completion_marker(tmp_path: Path):
@@ -326,9 +383,7 @@ def test_paired_validator_rejects_non_gripper_action_change(tmp_path: Path):
         if row["condition"] == "forced_release" and row["step_in_episode"] == 1
     )
     forced["executed_libero_action"][0] += 0.1
-    path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-    )
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     with pytest.raises(ValueError, match="non-gripper"):
         validate_paired_release_run(run_dir)
 

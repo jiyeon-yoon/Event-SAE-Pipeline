@@ -75,6 +75,11 @@ class PairedReleaseConfig:
     trigger_delay_steps: int = 0
     max_force_open_steps: int = 20
     stable_detach_steps: int = 2
+    # LIBERO's goal predicate can become true while the robot still holds the
+    # object. Keep the normal policy running briefly so its natural release is
+    # observed instead of ending on the first successful placement frame.
+    normal_post_success_steps: int = 20
+    post_detach_goal_stable_steps: int = 2
     forced_gripper_value: float = -1.0
     action_atol: float = 1e-6
     state_atol: float = 1e-6
@@ -227,6 +232,12 @@ def validate_paired_release_config(cfg: PairedReleaseRunConfig) -> None:
         raise ValueError("paired_release.max_force_open_steps must be positive")
     if paired.stable_detach_steps <= 0:
         raise ValueError("paired_release.stable_detach_steps must be positive")
+    if paired.normal_post_success_steps <= 0:
+        raise ValueError("paired_release.normal_post_success_steps must be positive")
+    if paired.post_detach_goal_stable_steps <= 0:
+        raise ValueError(
+            "paired_release.post_detach_goal_stable_steps must be positive"
+        )
     if paired.forced_gripper_value != -1.0:
         raise ValueError(
             "LIBERO paired release is fixed to forced_gripper_value=-1.0 (open)"
@@ -234,9 +245,7 @@ def validate_paired_release_config(cfg: PairedReleaseRunConfig) -> None:
     if paired.action_atol < 0 or paired.state_atol < 0:
         raise ValueError("paired release tolerances cannot be negative")
     if paired.target_valid_pairs_per_task <= 0:
-        raise ValueError(
-            "paired_release.target_valid_pairs_per_task must be positive"
-        )
+        raise ValueError("paired_release.target_valid_pairs_per_task must be positive")
     if paired.target_primary_pairs_per_task < 0:
         raise ValueError(
             "paired_release.target_primary_pairs_per_task cannot be negative"
@@ -251,22 +260,15 @@ def validate_paired_release_config(cfg: PairedReleaseRunConfig) -> None:
             "paired_release.target_primary_pairs_per_task cannot exceed "
             "env.num_trials_per_task (the maximum attempts per task)"
         )
-    if (
-        paired.target_primary_pairs_per_task
-        > paired.target_valid_pairs_per_task
-    ):
+    if paired.target_primary_pairs_per_task > paired.target_valid_pairs_per_task:
         raise ValueError(
             "paired_release.target_primary_pairs_per_task cannot exceed "
             "target_valid_pairs_per_task because every primary pair is valid"
         )
     if paired.min_free_disk_gb_at_start <= 0:
-        raise ValueError(
-            "paired_release.min_free_disk_gb_at_start must be positive"
-        )
+        raise ValueError("paired_release.min_free_disk_gb_at_start must be positive")
     if paired.abort_below_free_disk_gb <= 0:
-        raise ValueError(
-            "paired_release.abort_below_free_disk_gb must be positive"
-        )
+        raise ValueError("paired_release.abort_below_free_disk_gb must be positive")
     if paired.min_free_disk_gb_at_start <= paired.abort_below_free_disk_gb:
         raise ValueError("initial free-disk guard must exceed the runtime guard")
     if paired.disk_check_every_steps <= 0:
@@ -276,9 +278,7 @@ def validate_paired_release_config(cfg: PairedReleaseRunConfig) -> None:
     if any(not value for value in paired.destination_by_task.values()):
         raise ValueError("paired_release.destination_by_task values cannot be empty")
     if not cfg.output.save_model_input_rgb:
-        raise ValueError(
-            "Paired validation requires output.save_model_input_rgb=true"
-        )
+        raise ValueError("Paired validation requires output.save_model_input_rgb=true")
     if not cfg.collection.fail_fast:
         raise ValueError(
             "Paired collection requires collection.fail_fast=true so a failed "

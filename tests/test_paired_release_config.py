@@ -44,6 +44,8 @@ def test_paired_config_loads_mappings_and_overrides(tmp_path: Path):
     assert cfg.paired_release.target_object_by_task == {"0": "bowl"}
     assert cfg.paired_release.target_valid_pairs_per_task == 20
     assert cfg.paired_release.target_primary_pairs_per_task == 20
+    assert cfg.paired_release.normal_post_success_steps == 20
+    assert cfg.paired_release.post_detach_goal_stable_steps == 2
 
 
 @pytest.mark.parametrize(
@@ -54,6 +56,14 @@ def test_paired_config_loads_mappings_and_overrides(tmp_path: Path):
         ("paired_release.trigger_delay_steps=-1", "trigger_delay_steps"),
         ("paired_release.max_force_open_steps=0", "max_force_open_steps"),
         ("paired_release.stable_detach_steps=0", "stable_detach_steps"),
+        (
+            "paired_release.normal_post_success_steps=0",
+            "normal_post_success_steps",
+        ),
+        (
+            "paired_release.post_detach_goal_stable_steps=0",
+            "post_detach_goal_stable_steps",
+        ),
         ("paired_release.forced_gripper_value=1", "forced_gripper_value"),
         ("paired_release.action_atol=-1", "tolerances"),
         (

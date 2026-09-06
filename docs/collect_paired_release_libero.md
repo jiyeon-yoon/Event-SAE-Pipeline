@@ -15,13 +15,19 @@ intervention만 새 rollout이 필요하다.
 `valid`와 `primary` 목표를 모두 채우면 해당 run을 즉시 종료한다.
 
 - `valid`: 동일 초기 상태·prefix와 강제 detach가 기술적으로 검증된 pair
-- `primary`: valid이면서 normal이 성공하고 자연 release도 관측된 주 분석용 pair
+- `primary`: valid이면서 normal 성공, 자연 release, release 후 안정적인 goal
+  상태까지 확인된 주 분석용 pair
+
+LIBERO의 goal predicate는 물체를 아직 잡고 있어도 먼저 성공할 수 있다. 따라서
+normal은 첫 성공 직후 종료하지 않고 20 step을 더 실행해 자연 open·detach를
+관측한다. open이 관측창 끝에 나오면 detach 확인용 20 step만 한 번 더 허용한다.
+detach 후 goal predicate가 2 step 연속 유지되어야 primary로 인정한다.
 
 ## 수집 데이터와 필요한 이유
 
 | 수집 데이터 | 필요한 이유 |
 |---|---|
-| pair/task/seed, initial state 파일·hash, `normal`/`forced_release`, `t_cmd`·`t_detach`·`t_obs` | 같은 시작점의 정상 release와 조기 release를 정확히 정렬·비교 |
+| pair/task/seed, initial state 파일·hash, `normal`/`forced_release`, `t_cmd`·`t_detach`·`t_obs`·release 후 goal 안정 시점 | 같은 시작점의 정상 release와 조기 release를 정확히 정렬·비교 |
 | object·fixture pose와 선/각속도, robot joint·EEF·gripper 상태 | 접근→grasp→lift→drop→placement의 물리 변화와 실패 위치 분석 |
 | 활성 MuJoCo contact·contact force·geom owner, object별 grasp flag | 접촉·grasp·detach를 주관적 라벨 없이 판정 |
 | reward·done·success·info, BDDL goal predicate의 step 전/후 만족 여부 | 성공 여부와 목표 진행 상태를 simulator 기준으로 판정 |
@@ -45,6 +51,8 @@ feature intervention 결과는 정책을 다시 실행해야 하므로 별도 ro
 | task별 `valid`·`primary` 목표 | 일부 task의 쓸 수 있는 pair가 0개인데 전체 합계만 통과하는 문제 방지 |
 | 최대 시도 횟수 + 목표 달성 시 조기 종료 | 실패가 많은 task의 무한 실행을 막고, 충분히 모이면 GPU 비용 절감 |
 | `valid`와 `primary` 분리 | 기술적으로 올바른 pair와 실제 주 분석에 적합한 pair를 구분 |
+| normal 성공 후 제한된 추가 관측 | goal이 release보다 먼저 성공해 자연 open·detach 기록이 누락되는 문제 방지 |
+| detach 후 goal 연속 확인 | 물체가 순간적으로 목표에 닿았다가 떨어진 경우를 정상 control에서 제외 |
 | summary·pair·episode 원본 기록 교차검증 | 잘못된 집계나 조건 기록으로 quota가 거짓 통과하는 문제 방지 |
 | 목표 미달 시 실패 상태·완료 마커 미생성 | 불완전 데이터를 정상 완료본으로 업로드·사용하지 않기 위해 |
 | 전체 10개 task smoke test | 본 수집 전에 task별 trigger, normal 성공·자연 release, 저장 구조 문제 확인 |

@@ -128,9 +128,7 @@ class PrefixComparison:
             state_field, state_delta = max(
                 state_deltas.items(), key=lambda item: item[1]
             )
-        self.max_raw_action_abs_delta = max(
-            self.max_raw_action_abs_delta, raw_delta
-        )
+        self.max_raw_action_abs_delta = max(self.max_raw_action_abs_delta, raw_delta)
         self.max_policy_action_abs_delta = max(
             self.max_policy_action_abs_delta, policy_delta
         )
@@ -139,9 +137,7 @@ class PrefixComparison:
         self.max_stateful_sim_abs_delta = max(
             self.max_stateful_sim_abs_delta, state_delta
         )
-        rgb_equal = (
-            normal.model_input_rgb_sha256 == forced.model_input_rgb_sha256
-        )
+        rgb_equal = normal.model_input_rgb_sha256 == forced.model_input_rgb_sha256
         sim_equal = normal.stateful_sim_sha256 == forced.stateful_sim_sha256
         self.rgb_exact = self.rgb_exact and rgb_equal
         self.stateful_sim_exact = self.stateful_sim_exact and sim_equal
@@ -384,6 +380,71 @@ def _update_detach_state(
     return candidate, consecutive_ungrasped, transition, confirmed
 
 
+def _update_post_detach_goal_state(
+    *,
+    step: int,
+    detach_confirmed: int | None,
+    goal_satisfied: bool,
+    target_is_grasped: bool,
+    candidate: int | None,
+    consecutive_goal_steps: int,
+    required_steps: int,
+) -> tuple[int | None, int, int | None]:
+    """Confirm that the released object remains in the goal state."""
+
+    if (
+        detach_confirmed is None
+        or step < detach_confirmed
+        or not goal_satisfied
+        or target_is_grasped
+    ):
+        return None, 0, None
+    if candidate is None:
+        candidate = int(step)
+    consecutive_goal_steps += 1
+    confirmed = int(step) if consecutive_goal_steps >= required_steps else None
+    return candidate, consecutive_goal_steps, confirmed
+
+
+def _normal_post_success_stop_reason(
+    *,
+    step: int,
+    success_step: int | None,
+    t_cmd: int | None,
+    t_detach_confirmed: int | None,
+    t_goal_stable_after_detach: int | None,
+    observation_steps: int,
+    post_open_steps: int,
+    stable_detach_steps: int,
+    goal_stable_steps: int,
+) -> str | None:
+    """Return why a successful normal rollout may stop, or ``None`` to continue."""
+
+    if success_step is None:
+        return None
+    if (
+        t_cmd is not None
+        and t_detach_confirmed is not None
+        and t_goal_stable_after_detach is not None
+    ):
+        return "natural_release_goal_stable"
+
+    # A gripper-open command near the first observation boundary starts one
+    # final bounded window. This covers physical gripper-opening latency
+    # without allowing an unbounded rollout.
+    deadline = int(success_step) + int(observation_steps)
+    if t_cmd is not None:
+        deadline = max(deadline, int(t_cmd) + int(post_open_steps))
+    if t_detach_confirmed is not None:
+        deadline = max(
+            deadline,
+            int(t_detach_confirmed) + int(goal_stable_steps) - 1,
+        )
+    if step >= deadline:
+        return "post_success_observation_timeout"
+    return None
+
+
 def _run_episode(
     *,
     cfg: PairedReleaseRunConfig,
@@ -421,9 +482,7 @@ def _run_episode(
 
     # Reset before opening writer state.  A reset failure therefore cannot leave
     # an active half-episode in the durable output streams.
-    obs = _reset_to_initial_state(
-        env, initial_state, pair_seed, cfg.env.num_steps_wait
-    )
+    obs = _reset_to_initial_state(env, initial_state, pair_seed, cfg.env.num_steps_wait)
     prompt = writer.begin_episode(
         prompt_record={
             "episode_num": episode_num,
@@ -464,13 +523,31 @@ def _run_episode(
     t_obs: int | None = None
     t_post_detach_destination_contact: int | None = None
     t_goal_satisfied: int | None = None
+    t_goal_stable_after_detach: int | None = None
     detach_candidate: int | None = None
     destination_contact_candidate: int | None = None
+    post_detach_goal_candidate: int | None = None
     consecutive_ungrasped = 0
+    consecutive_post_detach_goal = 0
     forced_open_steps = 0
     success_step: int | None = None
+    normal_post_success_timeout = False
 
-    for step in range(max_steps):
+    # Do not let a late first success consume the post-success observation
+    # window.  Before success the original LIBERO horizon is still strict;
+    # only a successful normal rollout may use the bounded extension.
+    normal_extension = (
+        cfg.paired_release.normal_post_success_steps
+        + cfg.paired_release.max_force_open_steps
+        + cfg.paired_release.stable_detach_steps
+        + cfg.paired_release.post_detach_goal_stable_steps
+    )
+    loop_limit = (
+        max_steps + normal_extension if condition == NORMAL_CONDITION else max_steps
+    )
+    for step in range(loop_limit):
+        if condition == NORMAL_CONDITION and success_step is None and step >= max_steps:
+            break
         break_after_step = False
         transaction_started = False
         try:
@@ -572,10 +649,13 @@ def _run_episode(
                     if not target_grasped(pre.json_state, target_object) or not lifted:
                         invalid_reason = "trigger_state_mismatch"
                         break_after_step = True
-                    elif abs(
-                        float(policy_action[-1])
-                        - cfg.paired_release.forced_gripper_value
-                    ) <= cfg.paired_release.action_atol:
+                    elif (
+                        abs(
+                            float(policy_action[-1])
+                            - cfg.paired_release.forced_gripper_value
+                        )
+                        <= cfg.paired_release.action_atol
+                    ):
                         invalid_reason = "policy_already_open_at_trigger"
                         break_after_step = True
                     else:
@@ -585,8 +665,7 @@ def _run_episode(
                     invalid_reason is None
                     and t_cmd is not None
                     and t_detach_confirmed is None
-                    and forced_open_steps
-                    < cfg.paired_release.max_force_open_steps
+                    and forced_open_steps < cfg.paired_release.max_force_open_steps
                 )
                 if force_active:
                     executed_action = force_gripper_open(
@@ -636,18 +715,32 @@ def _run_episode(
             if (
                 t_detach is not None
                 and t_post_detach_destination_contact is None
-                and target_destination_contact(post.json_state, target_object, destination)
+                and target_destination_contact(
+                    post.json_state, target_object, destination
+                )
             ):
                 t_post_detach_destination_contact = int(step)
-            if (
-                t_cmd is not None
-                and t_goal_satisfied is None
-                and post.json_state["goals"].get(
-                    "all_goal_predicates_satisfied"
-                )
-                is True
-            ):
+            goal_satisfied_post = (
+                post.json_state["goals"].get("all_goal_predicates_satisfied") is True
+            )
+            if t_goal_satisfied is None and goal_satisfied_post:
                 t_goal_satisfied = int(step)
+            if t_goal_stable_after_detach is None:
+                (
+                    post_detach_goal_candidate,
+                    consecutive_post_detach_goal,
+                    goal_stable_confirmation,
+                ) = _update_post_detach_goal_state(
+                    step=step,
+                    detach_confirmed=t_detach_confirmed,
+                    goal_satisfied=goal_satisfied_post,
+                    target_is_grasped=target_grasped(post.json_state, target_object),
+                    candidate=post_detach_goal_candidate,
+                    consecutive_goal_steps=consecutive_post_detach_goal,
+                    required_steps=(cfg.paired_release.post_detach_goal_stable_steps),
+                )
+                if goal_stable_confirmation is not None:
+                    t_goal_stable_after_detach = int(goal_stable_confirmation)
             if (
                 condition == FORCED_RELEASE_CONDITION
                 and t_cmd is not None
@@ -699,17 +792,40 @@ def _run_episode(
                 if success_step is None:
                     success_step = int(step)
             if success:
-                # LIBERO can report success on the release transition itself.
-                # Keep at most a few extra closed-loop steps so stable detach
-                # and the first post-detach observation are not discarded.
-                confirmation_complete = (
-                    t_cmd is None or t_detach_confirmed is not None
-                )
-                confirmation_timeout = (
-                    step - int(success_step) >= cfg.paired_release.stable_detach_steps
-                )
-                if confirmation_complete or confirmation_timeout:
-                    break
+                if condition == NORMAL_CONDITION:
+                    # LIBERO's On predicate can report success while the robot
+                    # still holds the object. Continue the unmodified policy so
+                    # natural open, detach, and stable placement are observable.
+                    stop_reason = _normal_post_success_stop_reason(
+                        step=step,
+                        success_step=success_step,
+                        t_cmd=t_cmd,
+                        t_detach_confirmed=t_detach_confirmed,
+                        t_goal_stable_after_detach=(t_goal_stable_after_detach),
+                        observation_steps=(
+                            cfg.paired_release.normal_post_success_steps
+                        ),
+                        post_open_steps=(cfg.paired_release.max_force_open_steps),
+                        stable_detach_steps=(cfg.paired_release.stable_detach_steps),
+                        goal_stable_steps=(
+                            cfg.paired_release.post_detach_goal_stable_steps
+                        ),
+                    )
+                    if stop_reason is not None:
+                        normal_post_success_timeout = (
+                            stop_reason == "post_success_observation_timeout"
+                        )
+                        break
+                else:
+                    # Forced release only needs a stable detach after success;
+                    # its goal is expected to fail in the intervention branch.
+                    confirmation_complete = t_detach_confirmed is not None
+                    confirmation_timeout = (
+                        step - int(success_step)
+                        >= cfg.paired_release.stable_detach_steps
+                    )
+                    if confirmation_complete or confirmation_timeout:
+                        break
             if break_after_step:
                 break
         except Exception as exc:
@@ -778,11 +894,14 @@ def _run_episode(
         "t_detach": t_detach,
         "t_detach_confirmed": t_detach_confirmed,
         "t_obs": t_obs,
-        "t_post_detach_destination_contact": (
-            t_post_detach_destination_contact
-        ),
+        "t_post_detach_destination_contact": (t_post_detach_destination_contact),
         "t_goal_satisfied": t_goal_satisfied,
+        "t_goal_stable_after_detach": t_goal_stable_after_detach,
+        "normal_post_success_timeout": normal_post_success_timeout,
         "detach_confirmation_steps": cfg.paired_release.stable_detach_steps,
+        "post_detach_goal_confirmation_steps": (
+            cfg.paired_release.post_detach_goal_stable_steps
+        ),
         "forced_open_steps": forced_open_steps,
         "invalid_reason": invalid_reason,
     }
@@ -811,9 +930,7 @@ def _update_condition_summary(
 def _finish_condition_rates(aggregate: dict[str, Any]) -> None:
     for summary in aggregate["conditions"].values():
         summary["success_rate"] = (
-            summary["successes"] / summary["episodes"]
-            if summary["episodes"]
-            else 0.0
+            summary["successes"] / summary["episodes"] if summary["episodes"] else 0.0
         )
 
 
@@ -849,7 +966,7 @@ def collect_paired_release_libero(
         f"{cfg.env.task_suite_name}-paired-release",
     )
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v2",
+        "schema_version": "extended_openvla_libero_paired_release_v3",
         "collection_status": "in_progress",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "code": _git_state(repo_root),
@@ -872,9 +989,14 @@ def collect_paired_release_libero(
             ),
             "prefix_comparison_includes_trigger_step": True,
             "detach_confirmation_steps": cfg.paired_release.stable_detach_steps,
+            "normal_post_success_steps": (cfg.paired_release.normal_post_success_steps),
+            "post_detach_goal_stable_steps": (
+                cfg.paired_release.post_detach_goal_stable_steps
+            ),
             "primary_analysis_filter": (
                 "valid_pair and normal_success and "
-                "normal_natural_release_observed"
+                "normal_natural_release_observed and "
+                "normal_post_detach_goal_stable"
             ),
         },
         "alignment": "pre_state + raw/policy/executed action -> post_state",
@@ -906,9 +1028,7 @@ def collect_paired_release_libero(
     aggregate: dict[str, Any] = {
         "run_dir": str(run_dir),
         "max_attempts_per_task": cfg.env.num_trials_per_task,
-        "target_valid_pairs_per_task": (
-            cfg.paired_release.target_valid_pairs_per_task
-        ),
+        "target_valid_pairs_per_task": (cfg.paired_release.target_valid_pairs_per_task),
         "target_primary_pairs_per_task": (
             cfg.paired_release.target_primary_pairs_per_task
         ),
@@ -950,9 +1070,7 @@ def collect_paired_release_libero(
                 quota = TaskPairQuota(
                     task_id=task_id,
                     max_attempts=cfg.env.num_trials_per_task,
-                    target_valid_pairs=(
-                        cfg.paired_release.target_valid_pairs_per_task
-                    ),
+                    target_valid_pairs=(cfg.paired_release.target_valid_pairs_per_task),
                     target_primary_pairs=(
                         cfg.paired_release.target_primary_pairs_per_task
                     ),
@@ -974,15 +1092,15 @@ def collect_paired_release_libero(
                         env, preflight_obs, previous=None, dt=None
                     )
                     task_key = str(task_id)
-                    explicit_target = (
-                        cfg.paired_release.target_object_by_task.get(task_key)
+                    explicit_target = cfg.paired_release.target_object_by_task.get(
+                        task_key
                     )
                     target_object = resolve_target_object(
                         preflight.json_state,
                         explicit=explicit_target,
                     )
-                    explicit_destination = (
-                        cfg.paired_release.destination_by_task.get(task_key)
+                    explicit_destination = cfg.paired_release.destination_by_task.get(
+                        task_key
                     )
                     destination = resolve_goal_destination(
                         preflight.json_state,
@@ -1017,9 +1135,7 @@ def collect_paired_release_libero(
                             break
                         quota.begin_attempt(trial_idx)
                         aggregate["pair_candidates"] += 1
-                        initial_state = np.asarray(
-                            initial_states[trial_idx]
-                        ).copy()
+                        initial_state = np.asarray(initial_states[trial_idx]).copy()
                         pair_seed = _pair_seed(cfg.env.seed, task_id, trial_idx)
                         pair_id = _pair_id(
                             cfg.env.task_suite_name,
@@ -1064,9 +1180,7 @@ def collect_paired_release_libero(
                             trigger_step is not None
                             and int(trigger_step) in normal_trace
                             and abs(
-                                float(
-                                    normal_trace[int(trigger_step)].policy_action[-1]
-                                )
+                                float(normal_trace[int(trigger_step)].policy_action[-1])
                                 - cfg.paired_release.forced_gripper_value
                             )
                             <= cfg.paired_release.action_atol
@@ -1096,15 +1210,16 @@ def collect_paired_release_libero(
                                 "pair_seed": pair_seed,
                                 "target_object": target_object,
                                 "goal_destination": destination,
-                                "initial_state_sha256": normal[
-                                    "initial_state_sha256"
-                                ],
+                                "initial_state_sha256": normal["initial_state_sha256"],
                                 "normal_episode_num": normal_episode_num,
                                 "forced_episode_num": None,
                                 "normal_success": bool(normal["success"]),
                                 "normal_natural_release_observed": bool(
                                     normal.get("t_cmd") is not None
                                     and normal.get("t_detach_confirmed") is not None
+                                ),
+                                "normal_post_detach_goal_stable": bool(
+                                    normal.get("t_goal_stable_after_detach") is not None
                                 ),
                                 "primary_analysis_eligible": False,
                                 "normal": normal,
@@ -1180,15 +1295,19 @@ def collect_paired_release_libero(
                             invalid_reason = "forced_exception"
                         valid = invalid_reason is None
                         status = "valid" if valid else "invalid"
-                        aggregate[
-                            "valid_pairs" if valid else "invalid_pairs"
-                        ] += 1
+                        aggregate["valid_pairs" if valid else "invalid_pairs"] += 1
                         normal_natural_release = bool(
                             normal.get("t_cmd") is not None
                             and normal.get("t_detach_confirmed") is not None
                         )
+                        normal_post_detach_goal_stable = bool(
+                            normal.get("t_goal_stable_after_detach") is not None
+                        )
                         primary = bool(
-                            valid and normal["success"] and normal_natural_release
+                            valid
+                            and normal["success"]
+                            and normal_natural_release
+                            and normal_post_detach_goal_stable
                         )
                         aggregate["primary_analysis_pairs"] += int(primary)
                         quota.record_eligible(valid=valid, primary=primary)
@@ -1205,14 +1324,13 @@ def collect_paired_release_libero(
                             "pair_seed": pair_seed,
                             "target_object": target_object,
                             "goal_destination": destination,
-                            "initial_state_sha256": normal[
-                                "initial_state_sha256"
-                            ],
+                            "initial_state_sha256": normal["initial_state_sha256"],
                             "normal_episode_num": normal_episode_num,
                             "forced_episode_num": forced_episode_num,
                             "normal_success": bool(normal["success"]),
-                            "normal_natural_release_observed": (
-                                normal_natural_release
+                            "normal_natural_release_observed": (normal_natural_release),
+                            "normal_post_detach_goal_stable": (
+                                normal_post_detach_goal_stable
                             ),
                             "primary_analysis_eligible": primary,
                             "normal": normal,
@@ -1234,8 +1352,7 @@ def collect_paired_release_libero(
                         )
                         if forced_fatal is not None:
                             raise RuntimeError(
-                                "Forced paired collection failed: "
-                                f"{forced_fatal!r}"
+                                "Forced paired collection failed: " f"{forced_fatal!r}"
                             ) from forced_fatal
                         if not valid and cfg.paired_release.fail_on_invalid_pair:
                             raise RuntimeError(
@@ -1300,12 +1417,8 @@ def collect_paired_release_libero(
 
     validate_paired_release_run(
         run_dir,
-        min_valid_pairs_per_task=(
-            cfg.paired_release.target_valid_pairs_per_task
-        ),
-        min_primary_pairs_per_task=(
-            cfg.paired_release.target_primary_pairs_per_task
-        ),
+        min_valid_pairs_per_task=(cfg.paired_release.target_valid_pairs_per_task),
+        min_primary_pairs_per_task=(cfg.paired_release.target_primary_pairs_per_task),
         require_complete=False,
     )
     manifest["collection_status"] = "complete"

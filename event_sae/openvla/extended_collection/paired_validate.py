@@ -19,7 +19,7 @@ from event_sae.openvla.extended_collection.controlled_release import (
 from event_sae.openvla.extended_collection.validate import validate_extended_run
 
 
-PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v2"
+PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v3"
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -147,9 +147,7 @@ def _validate_prefix(
             raise ValueError(f"Paired simulator field presence differs: {key}")
         if key not in normal_sim:
             continue
-        delta = _max_delta(
-            normal_sim[key][:count], forced_sim[key][:count]
-        )
+        delta = _max_delta(normal_sim[key][:count], forced_sim[key][:count])
         state_deltas[field] = delta
         if delta > state_atol:
             raise ValueError(
@@ -174,8 +172,7 @@ def _validate_prefix(
         "max_qpos_abs_delta": qpos_delta,
         "max_qvel_abs_delta": qvel_delta,
         **{
-            f"max_pre_{field}_abs_delta": delta
-            for field, delta in state_deltas.items()
+            f"max_pre_{field}_abs_delta": delta for field, delta in state_deltas.items()
         },
     }
 
@@ -202,9 +199,7 @@ def _validate_actions(
 
     t_cmd = int(pair["forced_release"]["t_cmd"])
     t_detach = int(pair["forced_release"]["t_detach"])
-    t_detach_confirmed = int(
-        pair["forced_release"]["t_detach_confirmed"]
-    )
+    t_detach_confirmed = int(pair["forced_release"]["t_detach_confirmed"])
     applied_steps: list[int] = []
     for row in forced_actions:
         step = int(row["step_in_episode"])
@@ -224,9 +219,7 @@ def _validate_actions(
             )
         if applied:
             applied_steps.append(step)
-            if not only_gripper_was_overridden(
-                policy, executed, atol=action_atol
-            ):
+            if not only_gripper_was_overridden(policy, executed, atol=action_atol):
                 raise ValueError(
                     f"Forced release changed a non-gripper dimension: "
                     f"{pair['pair_id']} step={step}"
@@ -273,12 +266,8 @@ def validate_paired_release_run(
     if len(selected_task_ids) != len(set(selected_task_ids)):
         raise ValueError("resolved_task_ids contains duplicates")
     paired_cfg = manifest["config"]["paired_release"]
-    configured_valid_target = int(
-        paired_cfg["target_valid_pairs_per_task"]
-    )
-    configured_primary_target = int(
-        paired_cfg.get("target_primary_pairs_per_task", 0)
-    )
+    configured_valid_target = int(paired_cfg["target_valid_pairs_per_task"])
+    configured_primary_target = int(paired_cfg.get("target_primary_pairs_per_task", 0))
     required_valid = max(
         configured_valid_target,
         int(min_valid_pairs_per_task or 0),
@@ -411,6 +400,9 @@ def validate_paired_release_run(
             normal_result.get("t_cmd") is not None
             and normal_result.get("t_detach_confirmed") is not None
         )
+        expected_post_detach_goal_stable = bool(
+            normal_result.get("t_goal_stable_after_detach") is not None
+        )
         if bool(pair.get("normal_success")) != bool(normal_result.get("success")):
             raise ValueError(
                 f"Pair normal_success differs from episode result: {pair['pair_id']}"
@@ -421,6 +413,14 @@ def validate_paired_release_run(
         ):
             raise ValueError(
                 "Pair normal release status differs from episode result: "
+                f"{pair['pair_id']}"
+            )
+        if (
+            bool(pair.get("normal_post_detach_goal_stable"))
+            != expected_post_detach_goal_stable
+        ):
+            raise ValueError(
+                "Pair normal post-detach goal status differs from episode result: "
                 f"{pair['pair_id']}"
             )
         if not pair.get("eligible"):
@@ -458,14 +458,15 @@ def validate_paired_release_run(
             valid
             and normal_result.get("success")
             and expected_natural_release
+            and expected_post_detach_goal_stable
         )
         if bool(pair.get("primary_analysis_eligible")) != expected_primary:
-            raise ValueError(
-                f"Primary-analysis status mismatch: {pair['pair_id']}"
-            )
+            raise ValueError(f"Primary-analysis status mismatch: {pair['pair_id']}")
 
     if set(expected_by_episode) != set(prompts) or set(prompts) != set(episodes):
-        raise ValueError("Pair results do not cover every recorded episode exactly once")
+        raise ValueError(
+            "Pair results do not cover every recorded episode exactly once"
+        )
 
     if completed_summary is not None:
         eligible_count = len(eligible)
@@ -490,9 +491,7 @@ def validate_paired_release_run(
         }
         for field, expected_value in expected_global.items():
             if completed_summary.get(field) != expected_value:
-                raise ValueError(
-                    f"summary.{field} does not match the raw records"
-                )
+                raise ValueError(f"summary.{field} does not match the raw records")
         if completed_summary.get("per_task") != quota_summary_by_task:
             raise ValueError("summary.per_task does not match pair_results.jsonl")
 
@@ -510,9 +509,7 @@ def validate_paired_release_run(
                 "success_rate": successes / count if count else 0.0,
             }
         if completed_summary.get("conditions") != expected_conditions:
-            raise ValueError(
-                "summary.conditions does not match episode_results.jsonl"
-            )
+            raise ValueError("summary.conditions does not match episode_results.jsonl")
     for episode_num, expected in expected_by_episode.items():
         _assert_episode_identity(prompts[episode_num], expected, source="prompt")
         _assert_episode_identity(episodes[episode_num], expected, source="result")
@@ -533,10 +530,7 @@ def validate_paired_release_run(
                 row, expected_by_episode[episode_num], source=filename
             )
     activation_index = (
-        root
-        / "sae_activations"
-        / "post_mlp_residual"
-        / "activation_index.jsonl"
+        root / "sae_activations" / "post_mlp_residual" / "activation_index.jsonl"
     )
     for row in _iter_jsonl(activation_index):
         episode_num = int(row["episode_num"])
@@ -549,14 +543,21 @@ def validate_paired_release_run(
     confirmation_checks: dict[tuple[int, int], dict[str, Any]] = {}
     obs_checks: dict[tuple[int, int], dict[str, Any]] = {}
     contact_checks: dict[tuple[int, int], dict[str, Any]] = {}
+    normal_detach_checks: dict[tuple[int, int], dict[str, Any]] = {}
+    normal_confirmation_checks: dict[tuple[int, int], dict[str, Any]] = {}
+    normal_goal_checks: dict[tuple[int, int], dict[str, Any]] = {}
     prefix_metrics: dict[str, dict[str, float | bool]] = {}
     action_atol = float(manifest["config"]["paired_release"]["action_atol"])
     state_atol = float(manifest["config"]["paired_release"]["state_atol"])
-    max_force_steps = int(
-        manifest["config"]["paired_release"]["max_force_open_steps"]
-    )
+    max_force_steps = int(manifest["config"]["paired_release"]["max_force_open_steps"])
     stable_detach_steps = int(
         manifest["config"]["paired_release"]["stable_detach_steps"]
+    )
+    post_detach_goal_stable_steps = int(
+        manifest["config"]["paired_release"]["post_detach_goal_stable_steps"]
+    )
+    forced_gripper_value = float(
+        manifest["config"]["paired_release"]["forced_gripper_value"]
     )
 
     for pair in valid_pairs:
@@ -566,8 +567,7 @@ def validate_paired_release_run(
         if (
             normal_prompt["initial_state_sha256"]
             != forced_prompt["initial_state_sha256"]
-            or normal_prompt["initial_state_sha256"]
-            != pair["initial_state_sha256"]
+            or normal_prompt["initial_state_sha256"] != pair["initial_state_sha256"]
         ):
             raise ValueError(f"Paired initial states differ: {pair['pair_id']}")
         normal_result, forced_result = episodes[normal_num], episodes[forced_num]
@@ -575,19 +575,15 @@ def validate_paired_release_run(
             "warm_start_sim_state_sha256",
             "warm_start_source_rgb_sha256",
         ):
-            if (
-                not normal_result.get(field)
-                or normal_result.get(field) != forced_result.get(field)
-            ):
+            if not normal_result.get(field) or normal_result.get(
+                field
+            ) != forced_result.get(field):
                 raise ValueError(
-                    f"Paired warm-start evidence differs: "
-                    f"{pair['pair_id']} {field}"
+                    f"Paired warm-start evidence differs: " f"{pair['pair_id']} {field}"
                 )
         t_cmd = pair["forced_release"].get("t_cmd")
         t_detach = pair["forced_release"].get("t_detach")
-        t_detach_confirmed = pair["forced_release"].get(
-            "t_detach_confirmed"
-        )
+        t_detach_confirmed = pair["forced_release"].get("t_detach_confirmed")
         trigger_step = pair["normal"]["trigger"].get("trigger_step")
         if (
             t_cmd is None
@@ -600,11 +596,7 @@ def validate_paired_release_run(
         t_detach = int(t_detach)
         t_detach_confirmed = int(t_detach_confirmed)
         trigger_step = int(trigger_step)
-        if (
-            t_cmd != trigger_step
-            or t_detach < t_cmd
-            or t_detach_confirmed < t_detach
-        ):
+        if t_cmd != trigger_step or t_detach < t_cmd or t_detach_confirmed < t_detach:
             raise ValueError(f"Invalid release timestamp order: {pair['pair_id']}")
         if t_detach_confirmed - t_cmd + 1 > max_force_steps:
             raise ValueError(
@@ -612,9 +604,7 @@ def validate_paired_release_run(
             )
         expected_confirmation = t_detach + stable_detach_steps - 1
         if t_detach_confirmed != expected_confirmation:
-            raise ValueError(
-                f"Detach confirmation window mismatch: {pair['pair_id']}"
-            )
+            raise ValueError(f"Detach confirmation window mismatch: {pair['pair_id']}")
         t_obs = pair["forced_release"].get("t_obs")
         if t_obs is not None and int(t_obs) != t_detach + 1:
             raise ValueError(
@@ -627,6 +617,67 @@ def validate_paired_release_run(
             actions[forced_num],
             action_atol=action_atol,
         )
+        if bool(pair.get("primary_analysis_eligible")):
+            normal_t_cmd = normal_result.get("t_cmd")
+            normal_t_detach = normal_result.get("t_detach")
+            normal_t_detach_confirmed = normal_result.get("t_detach_confirmed")
+            normal_t_goal_stable = normal_result.get("t_goal_stable_after_detach")
+            if None in (
+                normal_t_cmd,
+                normal_t_detach,
+                normal_t_detach_confirmed,
+                normal_t_goal_stable,
+            ):
+                raise ValueError(
+                    f"Primary pair lacks normal release evidence: {pair['pair_id']}"
+                )
+            normal_t_cmd = int(normal_t_cmd)
+            normal_t_detach = int(normal_t_detach)
+            normal_t_detach_confirmed = int(normal_t_detach_confirmed)
+            normal_t_goal_stable = int(normal_t_goal_stable)
+            if not (
+                normal_t_cmd
+                <= normal_t_detach
+                <= normal_t_detach_confirmed
+                <= normal_t_goal_stable
+            ):
+                raise ValueError(
+                    f"Invalid normal release timestamp order: {pair['pair_id']}"
+                )
+            if normal_t_detach_confirmed != normal_t_detach + stable_detach_steps - 1:
+                raise ValueError(
+                    f"Normal detach confirmation mismatch: {pair['pair_id']}"
+                )
+            normal_goal_start = normal_t_goal_stable - post_detach_goal_stable_steps + 1
+            if normal_goal_start < normal_t_detach_confirmed:
+                raise ValueError(
+                    f"Normal post-detach goal window starts too early: "
+                    f"{pair['pair_id']}"
+                )
+            if bool(normal_result.get("normal_post_success_timeout")):
+                raise ValueError(
+                    f"Primary pair ended by normal observation timeout: "
+                    f"{pair['pair_id']}"
+                )
+            if normal_t_cmd >= len(actions[normal_num]):
+                raise ValueError(
+                    f"Normal t_cmd is outside its action rows: {pair['pair_id']}"
+                )
+            normal_open_action = np.asarray(
+                actions[normal_num][normal_t_cmd]["policy_libero_action"],
+                dtype=np.float64,
+            )
+            if abs(float(normal_open_action[-1]) - forced_gripper_value) > action_atol:
+                raise ValueError(
+                    f"Normal t_cmd is not a natural open action: {pair['pair_id']}"
+                )
+            normal_detach_checks[(normal_num, normal_t_detach)] = pair
+            for confirmation_step in range(
+                normal_t_detach, normal_t_detach_confirmed + 1
+            ):
+                normal_confirmation_checks[(normal_num, confirmation_step)] = pair
+            for goal_step in range(normal_goal_start, normal_t_goal_stable + 1):
+                normal_goal_checks[(normal_num, goal_step)] = pair
         prefix_metrics[pair["pair_id"]] = _validate_prefix(
             root,
             normal_result,
@@ -641,9 +692,7 @@ def validate_paired_release_run(
             confirmation_checks[(forced_num, confirmation_step)] = pair
         if t_obs is not None:
             obs_checks[(forced_num, int(t_obs))] = pair
-        contact_step = pair["forced_release"].get(
-            "t_post_detach_destination_contact"
-        )
+        contact_step = pair["forced_release"].get("t_post_detach_destination_contact")
         if contact_step is not None:
             contact_checks[(forced_num, int(contact_step))] = pair
 
@@ -651,15 +700,50 @@ def validate_paired_release_run(
     seen_confirmation: set[tuple[int, int]] = set()
     seen_obs: set[str] = set()
     seen_contact: set[str] = set()
+    seen_normal_detach: set[str] = set()
+    seen_normal_confirmation: set[tuple[int, int]] = set()
+    seen_normal_goal: set[tuple[int, int]] = set()
     for row in _iter_jsonl(root / "trajectory_records.jsonl"):
         key = (int(row["episode_num"]), int(row["step_in_episode"]))
+        if key in normal_detach_checks:
+            pair = normal_detach_checks[key]
+            target = pair["target_object"]
+            if not target_grasped(row["pre"], target) or target_grasped(
+                row["post"], target
+            ):
+                raise ValueError(
+                    f"Normal t_detach is not grasp True->False: {pair['pair_id']}"
+                )
+            seen_normal_detach.add(pair["pair_id"])
+        if key in normal_confirmation_checks:
+            pair = normal_confirmation_checks[key]
+            if target_grasped(row["post"], pair["target_object"]):
+                raise ValueError(
+                    f"Normal object was regrasped inside detach confirmation: "
+                    f"{pair['pair_id']}"
+                )
+            seen_normal_confirmation.add(key)
+        if key in normal_goal_checks:
+            pair = normal_goal_checks[key]
+            goal_satisfied = (
+                row["post"].get("goals", {}).get("all_goal_predicates_satisfied")
+                is True
+            )
+            if not goal_satisfied or target_grasped(row["post"], pair["target_object"]):
+                raise ValueError(
+                    f"Normal post-detach goal window is not stable: "
+                    f"{pair['pair_id']}"
+                )
+            seen_normal_goal.add(key)
         if key in detach_checks:
             pair = detach_checks[key]
             target = pair["target_object"]
             if not target_grasped(row["pre"], target) or target_grasped(
                 row["post"], target
             ):
-                raise ValueError(f"t_detach is not grasp True->False: {pair['pair_id']}")
+                raise ValueError(
+                    f"t_detach is not grasp True->False: {pair['pair_id']}"
+                )
             seen_detach.add(pair["pair_id"])
         if key in confirmation_checks:
             pair = confirmation_checks[key]
@@ -690,10 +774,12 @@ def validate_paired_release_run(
     if seen_detach != {row["pair_id"] for row in valid_pairs}:
         raise ValueError("Not every valid pair has a verified detach transition")
     if seen_confirmation != set(confirmation_checks):
-        raise ValueError(
-            "Not every valid pair has a stable verified detach window"
-        )
-    if seen_obs != {row["pair_id"] for row in valid_pairs if row["forced_release"].get("t_obs") is not None}:
+        raise ValueError("Not every valid pair has a stable verified detach window")
+    if seen_obs != {
+        row["pair_id"]
+        for row in valid_pairs
+        if row["forced_release"].get("t_obs") is not None
+    }:
         raise ValueError("Not every recorded t_obs was verified")
     if seen_contact != {
         row["pair_id"]
@@ -701,6 +787,17 @@ def validate_paired_release_run(
         if row["forced_release"].get("t_post_detach_destination_contact") is not None
     }:
         raise ValueError("Not every recorded fixture-contact time was verified")
+    primary_pair_ids = {
+        row["pair_id"]
+        for row in valid_pairs
+        if bool(row.get("primary_analysis_eligible"))
+    }
+    if seen_normal_detach != primary_pair_ids:
+        raise ValueError("Not every primary pair has a verified normal detach")
+    if seen_normal_confirmation != set(normal_confirmation_checks):
+        raise ValueError("Not every primary pair has a stable normal detach window")
+    if seen_normal_goal != set(normal_goal_checks):
+        raise ValueError("Not every primary pair has a stable post-detach goal window")
 
     return {
         **structural,
