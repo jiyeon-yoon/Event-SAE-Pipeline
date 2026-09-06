@@ -1,0 +1,61 @@
+# Independent research collector: normal and premature-release rollouts from
+# exactly the same LIBERO initial state. It does not call the original
+# Event-SAE activation collector.
+model:
+  family: openvla
+  checkpoint: openvla/openvla-7b-finetuned-libero-spatial
+  revision: 962318cec55ac10993ff0f5f43eda9a270b4c873
+  code_revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f
+  load_in_8bit: false
+  load_in_4bit: false
+  center_crop: true
+
+env:
+  task_suite_name: libero_spatial
+  num_steps_wait: 10
+  # Maximum distinct initial-state attempts per task. Collection stops early
+  # when both per-task pair targets below are reached.
+  num_trials_per_task: 50
+  seed: 0
+  # Exactly one task per run. Use five Pods and run two task IDs sequentially
+  # on each Pod; each task is validated and uploaded independently.
+  task_ids: "0"
+  resolution: 256
+
+output:
+  root_dir: /workspace/results/paired-release-libero
+  save_video: true
+  video_fps: 30
+  save_model_input_rgb: true
+  compress_npz: true
+  flush_jsonl_every_step: true
+
+collection:
+  layer_idx: 31
+  activation_flush_every: 50000
+  save_observation_state: true
+  save_simulator_state: true
+  save_object_and_fixture_state: true
+  save_contacts_and_grasp: true
+  save_goal_predicates: true
+  save_policy_uncertainty: true
+  strict_preflight: true
+  fail_fast: true
+
+paired_release:
+  stable_grasp_steps: 3
+  min_lift_delta_m: 0.02
+  trigger_delay_steps: 0
+  max_force_open_steps: 20
+  stable_detach_steps: 2
+  forced_gripper_value: -1.0
+  action_atol: 1.0e-6
+  state_atol: 1.0e-6
+  fail_on_invalid_pair: false
+  target_valid_pairs_per_task: 20
+  target_primary_pairs_per_task: 20
+  min_free_disk_gb_at_start: 80
+  abort_below_free_disk_gb: 20
+  disk_check_every_steps: 25
+  target_object_by_task: {}
+  destination_by_task: {}

@@ -34,6 +34,7 @@ class Layer31ActivationCollector:
         self._shard_id = 0
         self._forward_id = 0
         self._closed = False
+        self._transaction: tuple[int, int, int, int] | None = None
         self._hook = layers[self.layer_idx].register_forward_hook(self._capture)
 
     def _capture(self, module, inputs, output):
@@ -63,20 +64,63 @@ class Layer31ActivationCollector:
                 "task_episode_idx": int(context["task_episode_idx"]),
                 "task_description": context.get("task_description"),
                 "step_in_episode": int(context["step_in_episode"]),
+                "pair_id": context.get("pair_id"),
+                "condition": context.get("condition"),
+                "pair_seed": context.get("pair_seed"),
                 "global_forward_idx": self._forward_id,
                 "tokens_in_forward": row_count,
             }
         )
         self._buffer.append(sample)
         self._rows += row_count
+        if self._transaction is None and self._rows >= self._flush_every:
+            self._flush()
+
+    def begin_step(self, context: dict) -> None:
+        """Stage hook rows until the matching policy step is durably written."""
+
+        if self._transaction is not None:
+            raise RuntimeError("An activation step transaction is already active")
+        self.model._sae_hook_context = dict(context)
+        self._transaction = (
+            len(self._buffer),
+            len(self._records),
+            self._rows,
+            self._forward_id,
+        )
+
+    def commit_step(self) -> None:
+        if self._transaction is None:
+            raise RuntimeError("No activation step transaction is active")
+        self._transaction = None
         if self._rows >= self._flush_every:
             self._flush()
+
+    def abort_step(self) -> None:
+        if self._transaction is None:
+            return
+        buffer_len, record_len, rows, forward_id = self._transaction
+        del self._buffer[buffer_len:]
+        del self._records[record_len:]
+        self._rows = rows
+        self._forward_id = forward_id
+        self._transaction = None
+
+    def flush_episode(self) -> None:
+        """Persist committed rows at an episode boundary."""
+
+        if self._transaction is not None:
+            raise RuntimeError("Cannot flush during an activation transaction")
+        self._flush()
 
     def _flush(self) -> None:
         if not self._buffer:
             return
         shard_name = f"layer_31_shard_{self._shard_id:06d}.pt"
-        torch.save(torch.cat(self._buffer, dim=0), self.output_dir / shard_name)
+        shard_path = self.output_dir / shard_name
+        temporary_path = shard_path.with_suffix(shard_path.suffix + ".tmp")
+        torch.save(torch.cat(self._buffer, dim=0), temporary_path)
+        temporary_path.replace(shard_path)
         for record in self._records:
             record["shard_path"] = shard_name
             self._index.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -90,6 +134,7 @@ class Layer31ActivationCollector:
         if self._closed:
             return
         try:
+            self.abort_step()
             self._flush()
         finally:
             self._hook.remove()

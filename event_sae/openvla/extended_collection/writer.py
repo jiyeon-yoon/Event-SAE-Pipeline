@@ -79,7 +79,13 @@ class EpisodeBuffer:
 class ExtendedRunWriter:
     """Own all output streams so the runner can close them in one finally block."""
 
-    def __init__(self, run_dir: str | Path, *, flush_every_step: bool = True):
+    def __init__(
+        self,
+        run_dir: str | Path,
+        *,
+        flush_every_step: bool = True,
+        enable_pair_results: bool = False,
+    ):
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.flush_every_step = bool(flush_every_step)
@@ -105,6 +111,11 @@ class ExtendedRunWriter:
         )
         self.uncertainty_stream = (self.run_dir / "policy_uncertainty.jsonl").open(
             "w", encoding="utf-8"
+        )
+        self.pair_stream = (
+            (self.run_dir / "pair_results.jsonl").open("w", encoding="utf-8")
+            if enable_pair_results
+            else None
         )
         self._buffer: EpisodeBuffer | None = None
 
@@ -161,6 +172,8 @@ class ExtendedRunWriter:
         raw_action: np.ndarray,
         executed_action: np.ndarray,
         policy: Dict[str, Any],
+        policy_action: np.ndarray | None = None,
+        intervention: Dict[str, Any] | None = None,
         model_input_rgb: np.ndarray | None,
         reward: float,
         done: bool,
@@ -172,6 +185,12 @@ class ExtendedRunWriter:
         sim_row, vision_row = self._buffer.add(
             step_id, pre_vectors, post_vectors, model_input_rgb
         )
+        policy_action = (
+            np.asarray(executed_action)
+            if policy_action is None
+            else np.asarray(policy_action)
+        )
+        intervention = dict(intervention or {"forced_open_applied": False})
         record = {
             **common,
             "alignment": "pre_state + action -> post_state",
@@ -180,7 +199,9 @@ class ExtendedRunWriter:
             "pre": pre_json,
             "post": post_json,
             "raw_openvla_action": np.asarray(raw_action),
+            "policy_libero_action": policy_action,
             "executed_libero_action": np.asarray(executed_action),
+            "intervention": intervention,
             "reward": float(reward),
             "done": bool(done),
             "info": info,
@@ -191,7 +212,9 @@ class ExtendedRunWriter:
             {
                 **common,
                 "raw_openvla_action": np.asarray(raw_action),
+                "policy_libero_action": policy_action,
                 "executed_libero_action": np.asarray(executed_action),
+                "intervention": intervention,
             },
             self.flush_every_step,
         )
@@ -200,6 +223,11 @@ class ExtendedRunWriter:
             {**common, **policy},
             self.flush_every_step,
         )
+
+    def write_pair_result(self, value: Dict[str, Any]) -> None:
+        if self.pair_stream is None:
+            raise RuntimeError("Pair-result output was not enabled")
+        _append_jsonl(self.pair_stream, value, True)
 
     def finish_episode(
         self,
@@ -249,13 +277,16 @@ class ExtendedRunWriter:
         return final
 
     def close(self) -> None:
-        for stream in (
+        streams = [
             self.prompt_stream,
             self.trajectory_stream,
             self.episode_stream,
             self.action_stream,
             self.uncertainty_stream,
-        ):
+        ]
+        if self.pair_stream is not None:
+            streams.append(self.pair_stream)
+        for stream in streams:
             if not stream.closed:
                 stream.flush()
                 stream.close()

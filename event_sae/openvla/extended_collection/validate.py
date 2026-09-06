@@ -170,11 +170,19 @@ def _validate_uncertainty(row: dict[str, Any], key: tuple[int, int]) -> None:
             raise ValueError(f"Invalid action-token probability mass at step {key}")
 
 
-def validate_extended_run(run_dir: str | Path) -> dict[str, Any]:
+def validate_extended_run(
+    run_dir: str | Path,
+    *,
+    expected_schema_version: str = "extended_openvla_libero_v1",
+    expected_episode_count: int | None = None,
+) -> dict[str, Any]:
     run_dir = Path(run_dir).expanduser().resolve()
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != "extended_openvla_libero_v1":
-        raise ValueError("Unexpected extended dataset schema")
+    if manifest.get("schema_version") != expected_schema_version:
+        raise ValueError(
+            "Unexpected extended dataset schema: "
+            f"{manifest.get('schema_version')!r}; expected {expected_schema_version!r}"
+        )
     if manifest["activation_stream"]["layer"] != 31:
         raise ValueError("Only layer-31 activations are valid for this dataset")
     if manifest["policy_uncertainty"].get("full_logits_stored") is not False:
@@ -184,8 +192,11 @@ def validate_extended_run(run_dir: str | Path) -> dict[str, Any]:
 
     prompts = _jsonl(run_dir / "prompt_records.jsonl")
     episodes = _jsonl(run_dir / "episode_results.jsonl")
-    expected = len(manifest["resolved_task_ids"]) * int(
-        manifest["config"]["env"]["num_trials_per_task"]
+    expected = (
+        int(expected_episode_count)
+        if expected_episode_count is not None
+        else len(manifest["resolved_task_ids"])
+        * int(manifest["config"]["env"]["num_trials_per_task"])
     )
     if not (len(prompts) == len(episodes) == expected):
         raise ValueError(

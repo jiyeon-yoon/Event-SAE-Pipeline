@@ -46,3 +46,59 @@ def test_layer31_collector_writes_all_seven_policy_forwards(tmp_path: Path):
         )
         == 7
     )
+
+
+def test_pair_context_is_preserved_and_aborted_step_is_removed(tmp_path: Path):
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=torch.nn.ModuleList([torch.nn.Identity() for _ in range(32)])
+            )
+        )
+    )
+    collector = Layer31ActivationCollector(model, tmp_path, flush_every=100)
+    shared = {
+        "pair_id": "pair-0",
+        "pair_seed": 7,
+        "task_id": 0,
+        "task_episode_idx": 0,
+        "task_description": "test",
+        "step_in_episode": 0,
+    }
+    collector.begin_step(
+        {**shared, "episode_num": 1, "condition": "normal"}
+    )
+    model.language_model.model.layers[31](torch.zeros((1, 1, 4096)))
+    collector.commit_step()
+    collector.flush_episode()
+
+    collector.begin_step(
+        {**shared, "episode_num": 2, "condition": "forced_release"}
+    )
+    model.language_model.model.layers[31](torch.ones((1, 1, 4096)))
+    collector.commit_step()
+
+    collector.begin_step(
+        {
+            **shared,
+            "episode_num": 2,
+            "condition": "forced_release",
+            "step_in_episode": 1,
+        }
+    )
+    model.language_model.model.layers[31](torch.full((1, 1, 4096), 2.0))
+    collector.abort_step()
+    collector.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "activation_index.jsonl").read_text().splitlines()
+    ]
+    assert [
+        (row["episode_num"], row["condition"], row["pair_id"], row["pair_seed"])
+        for row in records
+    ] == [
+        (1, "normal", "pair-0", 7),
+        (2, "forced_release", "pair-0", 7),
+    ]
+    assert [row["global_forward_idx"] for row in records] == [1, 2]

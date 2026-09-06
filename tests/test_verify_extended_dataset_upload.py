@@ -7,6 +7,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.openvla.verify_extended_dataset_upload import (  # noqa: E402
     compare_inventories,
     local_inventory,
+    unexpected_remote_files,
 )
 
 
@@ -24,3 +25,15 @@ def test_compare_inventories_detects_missing_and_wrong_size():
     )
     assert missing == ["c"]
     assert wrong == [("b", 4, 8)]
+
+
+def test_unexpected_remote_files_rejects_stale_data_but_allows_hub_metadata():
+    local = {"manifest.json": 10, "shard-000.pt": 20}
+    remote = {
+        ".gitattributes": 1,
+        "README.md": 2,
+        "manifest.json": 10,
+        "shard-000.pt": 20,
+        "stale-shard.pt": 30,
+    }
+    assert unexpected_remote_files(local, remote) == ["stale-shard.pt"]

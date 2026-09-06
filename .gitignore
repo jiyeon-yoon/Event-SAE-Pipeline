@@ -35,6 +35,7 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
+pytest-of-*/
 
 # Editor / OS
 .vscode/

@@ -66,6 +66,44 @@ class ExtendedRunConfig:
         return asdict(self)
 
 
+@dataclass
+class PairedReleaseConfig:
+    """Objective trigger and validation rules for controlled release pairs."""
+
+    stable_grasp_steps: int = 3
+    min_lift_delta_m: float = 0.02
+    trigger_delay_steps: int = 0
+    max_force_open_steps: int = 20
+    stable_detach_steps: int = 2
+    forced_gripper_value: float = -1.0
+    action_atol: float = 1e-6
+    state_atol: float = 1e-6
+    fail_on_invalid_pair: bool = False
+    # env.num_trials_per_task is the maximum number of distinct initial-state
+    # attempts. A task stops early only after both quotas are reached.
+    target_valid_pairs_per_task: int = 20
+    target_primary_pairs_per_task: int = 20
+    min_free_disk_gb_at_start: float = 80.0
+    abort_below_free_disk_gb: float = 20.0
+    disk_check_every_steps: int = 25
+    target_object_by_task: Dict[str, str] = field(default_factory=dict)
+    destination_by_task: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PairedReleaseRunConfig:
+    """Standalone config for normal/forced-release paired collection."""
+
+    model: ModelConfig = field(default_factory=ModelConfig)
+    env: EnvConfig = field(default_factory=EnvConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
+    collection: CollectionConfig = field(default_factory=CollectionConfig)
+    paired_release: PairedReleaseConfig = field(default_factory=PairedReleaseConfig)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 def _deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in updates.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -108,6 +146,34 @@ def load_extended_config(
     return cfg
 
 
+def load_paired_release_config(
+    path: str | Path,
+    overrides: Dict[str, Any] | None = None,
+) -> PairedReleaseRunConfig:
+    """Load the paired collector without changing the normal-only config path."""
+
+    with Path(path).open("r", encoding="utf-8") as stream:
+        data = yaml.safe_load(stream) or {}
+    if overrides:
+        data = _deep_update(data, overrides)
+    paired_data = dict(data.get("paired_release", {}))
+    for mapping_name in ("target_object_by_task", "destination_by_task"):
+        mapping = paired_data.get(mapping_name, {}) or {}
+        paired_data[mapping_name] = {
+            str(key): str(value) for key, value in mapping.items()
+        }
+    cfg = PairedReleaseRunConfig(
+        model=ModelConfig(**data.get("model", {})),
+        env=EnvConfig(**data.get("env", {})),
+        output=OutputConfig(**data.get("output", {})),
+        collection=CollectionConfig(**data.get("collection", {})),
+        paired_release=PairedReleaseConfig(**paired_data),
+    )
+    validate_config(cfg)
+    validate_paired_release_config(cfg)
+    return cfg
+
+
 def validate_config(cfg: ExtendedRunConfig) -> None:
     if cfg.model.family != "openvla":
         raise ValueError(
@@ -141,4 +207,80 @@ def validate_config(cfg: ExtendedRunConfig) -> None:
         raise ValueError(
             "The extended-v1 schema requires every low-volume telemetry stream; "
             "disabled fields: " + ", ".join(disabled)
+        )
+
+
+def validate_paired_release_config(cfg: PairedReleaseRunConfig) -> None:
+    paired = cfg.paired_release
+    if not cfg.model.revision or not cfg.model.code_revision:
+        raise ValueError(
+            "Paired collection requires pinned model.revision and "
+            "model.code_revision"
+        )
+    if paired.stable_grasp_steps <= 0:
+        raise ValueError("paired_release.stable_grasp_steps must be positive")
+    if paired.min_lift_delta_m <= 0:
+        raise ValueError("paired_release.min_lift_delta_m must be positive")
+    if paired.trigger_delay_steps < 0:
+        raise ValueError("paired_release.trigger_delay_steps cannot be negative")
+    if paired.max_force_open_steps <= 0:
+        raise ValueError("paired_release.max_force_open_steps must be positive")
+    if paired.stable_detach_steps <= 0:
+        raise ValueError("paired_release.stable_detach_steps must be positive")
+    if paired.forced_gripper_value != -1.0:
+        raise ValueError(
+            "LIBERO paired release is fixed to forced_gripper_value=-1.0 (open)"
+        )
+    if paired.action_atol < 0 or paired.state_atol < 0:
+        raise ValueError("paired release tolerances cannot be negative")
+    if paired.target_valid_pairs_per_task <= 0:
+        raise ValueError(
+            "paired_release.target_valid_pairs_per_task must be positive"
+        )
+    if paired.target_primary_pairs_per_task < 0:
+        raise ValueError(
+            "paired_release.target_primary_pairs_per_task cannot be negative"
+        )
+    if paired.target_valid_pairs_per_task > cfg.env.num_trials_per_task:
+        raise ValueError(
+            "paired_release.target_valid_pairs_per_task cannot exceed "
+            "env.num_trials_per_task (the maximum attempts per task)"
+        )
+    if paired.target_primary_pairs_per_task > cfg.env.num_trials_per_task:
+        raise ValueError(
+            "paired_release.target_primary_pairs_per_task cannot exceed "
+            "env.num_trials_per_task (the maximum attempts per task)"
+        )
+    if (
+        paired.target_primary_pairs_per_task
+        > paired.target_valid_pairs_per_task
+    ):
+        raise ValueError(
+            "paired_release.target_primary_pairs_per_task cannot exceed "
+            "target_valid_pairs_per_task because every primary pair is valid"
+        )
+    if paired.min_free_disk_gb_at_start <= 0:
+        raise ValueError(
+            "paired_release.min_free_disk_gb_at_start must be positive"
+        )
+    if paired.abort_below_free_disk_gb <= 0:
+        raise ValueError(
+            "paired_release.abort_below_free_disk_gb must be positive"
+        )
+    if paired.min_free_disk_gb_at_start <= paired.abort_below_free_disk_gb:
+        raise ValueError("initial free-disk guard must exceed the runtime guard")
+    if paired.disk_check_every_steps <= 0:
+        raise ValueError("paired_release.disk_check_every_steps must be positive")
+    if any(not value for value in paired.target_object_by_task.values()):
+        raise ValueError("paired_release.target_object_by_task values cannot be empty")
+    if any(not value for value in paired.destination_by_task.values()):
+        raise ValueError("paired_release.destination_by_task values cannot be empty")
+    if not cfg.output.save_model_input_rgb:
+        raise ValueError(
+            "Paired validation requires output.save_model_input_rgb=true"
+        )
+    if not cfg.collection.fail_fast:
+        raise ValueError(
+            "Paired collection requires collection.fail_fast=true so a failed "
+            "policy forward cannot leave misaligned activation rows"
         )

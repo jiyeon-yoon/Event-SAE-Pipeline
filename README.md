@@ -39,6 +39,8 @@ Post-baseline research collector:
 
 - **실패·subgoal 연구용 독립 확장 수집기** —
   [docs/collect_extended_libero.md](docs/collect_extended_libero.md)
+- **동일 initial state normal/강제-release paired 수집기** —
+  [docs/collect_paired_release_libero.md](docs/collect_paired_release_libero.md)
 
 ## Current project scope
 
@@ -53,6 +55,10 @@ Post-baseline research collector:
   The other three LIBERO suites and the full intervention sweep were not run.
 - The new rich-data collector is independent research code. It does not modify
   or call the original Event-SAE activation collector.
+- The paired-release collector uses per-task valid/primary quotas and stops a
+  task early when both are reached; a task-level shortfall cannot be marked as
+  a complete dataset. Production runs use one task per run so a later task
+  failure cannot invalidate an already uploaded task.
 
 ## Repository layout
 
