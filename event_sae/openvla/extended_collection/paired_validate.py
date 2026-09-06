@@ -507,11 +507,57 @@ def validate_paired_release_run(
         if steps != list(range(len(rows))):
             raise ValueError("Non-contiguous action steps in paired run")
 
+    trajectory_rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for filename in ("trajectory_records.jsonl", "policy_uncertainty.jsonl"):
         for row in _iter_jsonl(root / filename):
             episode_num = int(row["episode_num"])
             _assert_episode_identity(
                 row, expected_by_episode[episode_num], source=filename
+            )
+            if filename == "trajectory_records.jsonl":
+                trajectory_rows[episode_num].append(row)
+
+    # Summary-level success must be backed by the simulator's per-step done
+    # signal; otherwise a primary quota could pass on inconsistent metadata.
+    for episode_num, result in episodes.items():
+        rows = trajectory_rows.get(episode_num, [])
+        steps = [int(row["step_in_episode"]) for row in rows]
+        if steps != list(range(len(rows))):
+            raise ValueError(
+                f"Non-contiguous trajectory steps for episode {episode_num}"
+            )
+        if int(result.get("recorded_steps", -1)) != len(rows):
+            raise ValueError(
+                f"recorded_steps differs from trajectory rows for episode "
+                f"{episode_num}"
+            )
+
+        done_steps = [
+            int(row["step_in_episode"]) for row in rows if bool(row.get("done"))
+        ]
+        expected_success = bool(done_steps)
+        if bool(result.get("success")) != expected_success:
+            raise ValueError(
+                f"Episode success differs from trajectory done signal: "
+                f"episode {episode_num}"
+            )
+        expected_success_step = done_steps[0] if done_steps else None
+        recorded_success_step = result.get("success_step")
+        if recorded_success_step is not None:
+            recorded_success_step = int(recorded_success_step)
+        if recorded_success_step != expected_success_step:
+            raise ValueError(
+                f"Episode success_step differs from first trajectory done: "
+                f"episode {episode_num}"
+            )
+        if (
+            result.get("condition") == NORMAL_CONDITION
+            and expected_success_step is not None
+            and len(rows) != expected_success_step + 1
+        ):
+            raise ValueError(
+                f"Successful normal episode continued after LIBERO done: "
+                f"episode {episode_num}"
             )
     activation_index = (
         root / "sae_activations" / "post_mlp_residual" / "activation_index.jsonl"

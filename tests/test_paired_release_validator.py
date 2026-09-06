@@ -140,7 +140,7 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                 else:
                     pre_grasped = step >= 1
                     post_grasped = step >= 1
-                normal_goal = condition == "normal" and primary and step >= 2
+                normal_goal = condition == "normal" and primary and step >= 3
                 pre = _state(
                     grasped=pre_grasped,
                     goal_satisfied=normal_goal and step >= 3,
@@ -169,12 +169,15 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                     policy=_uncertainty(),
                     model_input_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
                     reward=0.0,
-                    done=False,
+                    done=(condition == "normal" and primary and step == 3),
                     info={},
                 )
             result = {
                 **common_identity,
                 "success": condition == "normal" and primary,
+                "success_step": (
+                    3 if condition == "normal" and primary else None
+                ),
                 "initial_state_sha256": prompt["initial_state_sha256"],
                 "trigger": {"trigger_step": 1, "initial_object_z": 0.0},
                 "t_cmd": 1 if condition == "forced_release" else None,
@@ -320,6 +323,71 @@ def test_paired_validator_accepts_successful_control_as_primary(tmp_path: Path):
     run_dir = _build_run(tmp_path, primary=True)
     summary = validate_paired_release_run(run_dir)
     assert summary["per_task"]["0"]["primary_analysis_pairs"] == 1
+
+
+def test_paired_validator_rejects_success_without_trajectory_done(tmp_path: Path):
+    run_dir = _build_run(tmp_path, primary=True)
+    path = run_dir / "trajectory_records.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in rows:
+        if row["condition"] == "normal":
+            row["done"] = False
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="success differs from trajectory done"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_validator_rejects_wrong_success_step(tmp_path: Path):
+    run_dir = _build_run(tmp_path, primary=True)
+    result_path = run_dir / "episode_results.jsonl"
+    results = [json.loads(line) for line in result_path.read_text().splitlines()]
+    normal = next(row for row in results if row["condition"] == "normal")
+    normal["success_step"] = 2
+    result_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in results), encoding="utf-8"
+    )
+
+    pair_path = run_dir / "pair_results.jsonl"
+    pair = json.loads(pair_path.read_text())
+    pair["normal"]["success_step"] = 2
+    pair_path.write_text(json.dumps(pair) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="success_step differs from first"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_validator_rejects_normal_steps_after_success(tmp_path: Path):
+    run_dir = _build_run(tmp_path, primary=True)
+    trajectory_path = run_dir / "trajectory_records.jsonl"
+    rows = [json.loads(line) for line in trajectory_path.read_text().splitlines()]
+    normal_step_two = next(
+        row
+        for row in rows
+        if row["condition"] == "normal" and row["step_in_episode"] == 2
+    )
+    normal_step_two["done"] = True
+    trajectory_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    result_path = run_dir / "episode_results.jsonl"
+    results = [json.loads(line) for line in result_path.read_text().splitlines()]
+    normal = next(row for row in results if row["condition"] == "normal")
+    normal["success_step"] = 2
+    result_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in results), encoding="utf-8"
+    )
+
+    pair_path = run_dir / "pair_results.jsonl"
+    pair = json.loads(pair_path.read_text())
+    pair["normal"]["success_step"] = 2
+    pair_path.write_text(json.dumps(pair) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="continued after LIBERO done"):
+        validate_paired_release_run(run_dir)
 
 
 def test_paired_validator_can_run_before_completion_marker(tmp_path: Path):

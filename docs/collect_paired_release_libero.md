@@ -53,7 +53,7 @@ feature intervention 결과는 정책을 다시 실행해야 하므로 별도 ro
 | `valid`와 `primary` 분리 | 기술적으로 올바른 pair와 실제 주 분석에 적합한 pair를 구분 |
 | 공식 LIBERO 성공 종료 | benchmark와 다른 임의의 post-success 행동을 추가하지 않고 시간·비용 절감 |
 | `primary = valid + normal 성공` | 정상 control 성공과 같은 초기 상태의 강제 조기-release를 비교하기 위해 |
-| summary·pair·episode 원본 기록 교차검증 | 잘못된 집계나 조건 기록으로 quota가 거짓 통과하는 문제 방지 |
+| summary·pair·episode·trajectory 교차검증 | `success`/`success_step`이 simulator `done`과 다른데 quota가 거짓 통과하는 문제 방지 |
 | 목표 미달 시 실패 상태·완료 마커 미생성 | 불완전 데이터를 정상 완료본으로 업로드·사용하지 않기 위해 |
 | 전체 10개 task smoke test | 본 수집 전에 task별 trigger, normal 성공, 강제 detach, 저장 구조 문제 확인 |
 
