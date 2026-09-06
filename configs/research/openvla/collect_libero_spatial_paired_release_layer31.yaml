@@ -48,12 +48,6 @@ paired_release:
   trigger_delay_steps: 0
   max_force_open_steps: 20
   stable_detach_steps: 2
-  # LIBERO may report goal success before the policy opens the gripper.
-  # At 20 Hz this observes one second after success; a natural open command
-  # near that boundary starts one final one-second detach-confirmation window.
-  normal_post_success_steps: 20
-  # The goal must remain true after confirmed natural detach.
-  post_detach_goal_stable_steps: 2
   forced_gripper_value: -1.0
   action_atol: 1.0e-6
   state_atol: 1.0e-6

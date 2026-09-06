@@ -81,7 +81,7 @@ def _uncertainty():
     }
 
 
-def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
+def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
     run_dir = tmp_path / "paired"
     initial = np.asarray([1.0, 2.0], dtype=np.float32)
     vectors = {
@@ -90,7 +90,7 @@ def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
     }
     policy_action = np.asarray([0.1, 0, 0, 0, 0, 0, 1.0])
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v3",
+        "schema_version": "extended_openvla_libero_paired_release_v4",
         "collection_status": "complete",
         "activation_stream": {"layer": 31, "forwards_per_policy_step": 7},
         "policy_uncertainty": {"full_logits_stored": False},
@@ -106,8 +106,6 @@ def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
                 "state_atol": 1e-6,
                 "max_force_open_steps": 20,
                 "stable_detach_steps": 1,
-                "normal_post_success_steps": 20,
-                "post_detach_goal_stable_steps": 2,
                 "forced_gripper_value": -1.0,
                 "target_valid_pairs_per_task": 1,
                 "target_primary_pairs_per_task": int(primary),
@@ -133,8 +131,6 @@ def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
             for step in range(4):
                 applied = condition == "forced_release" and step == 1
                 step_policy_action = policy_action.copy()
-                if condition == "normal" and primary and step >= 2:
-                    step_policy_action[-1] = -1.0
                 executed = step_policy_action.copy()
                 if applied:
                     executed[-1] = -1.0
@@ -142,8 +138,8 @@ def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
                     pre_grasped = step == 1
                     post_grasped = False
                 else:
-                    pre_grasped = step >= 1 and not (primary and step >= 3)
-                    post_grasped = step >= 1 and not (primary and step >= 2)
+                    pre_grasped = step >= 1
+                    post_grasped = step >= 1
                 normal_goal = condition == "normal" and primary and step >= 2
                 pre = _state(
                     grasped=pre_grasped,
@@ -178,22 +174,12 @@ def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
                 )
             result = {
                 **common_identity,
-                "success": condition == "normal",
+                "success": condition == "normal" and primary,
                 "initial_state_sha256": prompt["initial_state_sha256"],
                 "trigger": {"trigger_step": 1, "initial_object_z": 0.0},
-                "t_cmd": (
-                    1 if condition == "forced_release" else (2 if primary else None)
-                ),
-                "t_detach": (
-                    1 if condition == "forced_release" else (2 if primary else None)
-                ),
-                "t_detach_confirmed": (
-                    1 if condition == "forced_release" else (2 if primary else None)
-                ),
-                "t_goal_stable_after_detach": (
-                    3 if condition == "normal" and primary else None
-                ),
-                "normal_post_success_timeout": False,
+                "t_cmd": 1 if condition == "forced_release" else None,
+                "t_detach": 1 if condition == "forced_release" else None,
+                "t_detach_confirmed": (1 if condition == "forced_release" else None),
                 "t_obs": None,
                 "t_post_detach_destination_contact": None,
                 "invalid_reason": None,
@@ -225,9 +211,8 @@ def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
                 ),
                 "normal_episode_num": 1,
                 "forced_episode_num": 2,
-                "normal_success": True,
-                "normal_natural_release_observed": primary,
-                "normal_post_detach_goal_stable": primary,
+                "normal_success": primary,
+                "normal_natural_release_observed": False,
                 "primary_analysis_eligible": primary,
                 "normal": episode_results["normal"],
                 "forced_release": episode_results["forced_release"],
@@ -296,9 +281,9 @@ def _build_run(tmp_path: Path, *, primary: bool = False) -> Path:
         "conditions": {
             "normal": {
                 "episodes": 1,
-                "successes": 1,
-                "failures": 0,
-                "success_rate": 1.0,
+                "successes": int(primary),
+                "failures": int(not primary),
+                "success_rate": float(primary),
             },
             "forced_release": {
                 "episodes": 1,
@@ -331,32 +316,10 @@ def test_paired_validator_checks_matched_prefix_and_gripper_only(tmp_path: Path)
     assert summary["prefix_metrics"][PAIR_ID]["rgb_exact"] is True
 
 
-def test_paired_validator_accepts_primary_natural_release_and_stable_goal(
-    tmp_path: Path,
-):
+def test_paired_validator_accepts_successful_control_as_primary(tmp_path: Path):
     run_dir = _build_run(tmp_path, primary=True)
     summary = validate_paired_release_run(run_dir)
     assert summary["per_task"]["0"]["primary_analysis_pairs"] == 1
-
-
-def test_paired_validator_rejects_forged_post_detach_goal_window(
-    tmp_path: Path,
-):
-    run_dir = _build_run(tmp_path, primary=True)
-    path = run_dir / "trajectory_records.jsonl"
-    rows = [json.loads(line) for line in path.read_text().splitlines()]
-    row = next(
-        item
-        for item in rows
-        if item["condition"] == "normal" and item["step_in_episode"] == 3
-    )
-    row["post"]["goals"]["all_goal_predicates_satisfied"] = False
-    path.write_text(
-        "".join(json.dumps(item) + "\n" for item in rows),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="post-detach goal window"):
-        validate_paired_release_run(run_dir)
 
 
 def test_paired_validator_can_run_before_completion_marker(tmp_path: Path):
@@ -445,7 +408,7 @@ def test_paired_validator_rejects_noncontiguous_task_attempts(tmp_path: Path):
 
 
 def test_paired_validator_rejects_primary_target_shortfall(tmp_path: Path):
-    run_dir = _build_run(tmp_path)
+    run_dir = _build_run(tmp_path, primary=False)
     manifest_path = run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["config"]["paired_release"]["target_primary_pairs_per_task"] = 1

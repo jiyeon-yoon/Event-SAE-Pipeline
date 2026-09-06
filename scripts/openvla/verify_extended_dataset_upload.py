@@ -74,7 +74,7 @@ def main() -> None:
     }
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     schema = manifest.get("schema_version")
-    if schema == "extended_openvla_libero_paired_release_v3":
+    if schema == "extended_openvla_libero_paired_release_v4":
         if manifest.get("collection_status") != "complete":
             raise RuntimeError("Paired collection is not marked complete")
         from event_sae.openvla.extended_collection.paired_validate import (

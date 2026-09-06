@@ -19,7 +19,7 @@ from event_sae.openvla.extended_collection.controlled_release import (
 from event_sae.openvla.extended_collection.validate import validate_extended_run
 
 
-PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v3"
+PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v4"
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -400,9 +400,6 @@ def validate_paired_release_run(
             normal_result.get("t_cmd") is not None
             and normal_result.get("t_detach_confirmed") is not None
         )
-        expected_post_detach_goal_stable = bool(
-            normal_result.get("t_goal_stable_after_detach") is not None
-        )
         if bool(pair.get("normal_success")) != bool(normal_result.get("success")):
             raise ValueError(
                 f"Pair normal_success differs from episode result: {pair['pair_id']}"
@@ -413,14 +410,6 @@ def validate_paired_release_run(
         ):
             raise ValueError(
                 "Pair normal release status differs from episode result: "
-                f"{pair['pair_id']}"
-            )
-        if (
-            bool(pair.get("normal_post_detach_goal_stable"))
-            != expected_post_detach_goal_stable
-        ):
-            raise ValueError(
-                "Pair normal post-detach goal status differs from episode result: "
                 f"{pair['pair_id']}"
             )
         if not pair.get("eligible"):
@@ -454,12 +443,7 @@ def validate_paired_release_run(
             raise ValueError(f"Valid pair has invalid_reason: {pair['pair_id']}")
         if not valid and not pair.get("invalid_reason"):
             raise ValueError(f"Invalid pair lacks invalid_reason: {pair['pair_id']}")
-        expected_primary = bool(
-            valid
-            and normal_result.get("success")
-            and expected_natural_release
-            and expected_post_detach_goal_stable
-        )
+        expected_primary = bool(valid and normal_result.get("success"))
         if bool(pair.get("primary_analysis_eligible")) != expected_primary:
             raise ValueError(f"Primary-analysis status mismatch: {pair['pair_id']}")
 
@@ -543,21 +527,12 @@ def validate_paired_release_run(
     confirmation_checks: dict[tuple[int, int], dict[str, Any]] = {}
     obs_checks: dict[tuple[int, int], dict[str, Any]] = {}
     contact_checks: dict[tuple[int, int], dict[str, Any]] = {}
-    normal_detach_checks: dict[tuple[int, int], dict[str, Any]] = {}
-    normal_confirmation_checks: dict[tuple[int, int], dict[str, Any]] = {}
-    normal_goal_checks: dict[tuple[int, int], dict[str, Any]] = {}
     prefix_metrics: dict[str, dict[str, float | bool]] = {}
     action_atol = float(manifest["config"]["paired_release"]["action_atol"])
     state_atol = float(manifest["config"]["paired_release"]["state_atol"])
     max_force_steps = int(manifest["config"]["paired_release"]["max_force_open_steps"])
     stable_detach_steps = int(
         manifest["config"]["paired_release"]["stable_detach_steps"]
-    )
-    post_detach_goal_stable_steps = int(
-        manifest["config"]["paired_release"]["post_detach_goal_stable_steps"]
-    )
-    forced_gripper_value = float(
-        manifest["config"]["paired_release"]["forced_gripper_value"]
     )
 
     for pair in valid_pairs:
@@ -617,67 +592,6 @@ def validate_paired_release_run(
             actions[forced_num],
             action_atol=action_atol,
         )
-        if bool(pair.get("primary_analysis_eligible")):
-            normal_t_cmd = normal_result.get("t_cmd")
-            normal_t_detach = normal_result.get("t_detach")
-            normal_t_detach_confirmed = normal_result.get("t_detach_confirmed")
-            normal_t_goal_stable = normal_result.get("t_goal_stable_after_detach")
-            if None in (
-                normal_t_cmd,
-                normal_t_detach,
-                normal_t_detach_confirmed,
-                normal_t_goal_stable,
-            ):
-                raise ValueError(
-                    f"Primary pair lacks normal release evidence: {pair['pair_id']}"
-                )
-            normal_t_cmd = int(normal_t_cmd)
-            normal_t_detach = int(normal_t_detach)
-            normal_t_detach_confirmed = int(normal_t_detach_confirmed)
-            normal_t_goal_stable = int(normal_t_goal_stable)
-            if not (
-                normal_t_cmd
-                <= normal_t_detach
-                <= normal_t_detach_confirmed
-                <= normal_t_goal_stable
-            ):
-                raise ValueError(
-                    f"Invalid normal release timestamp order: {pair['pair_id']}"
-                )
-            if normal_t_detach_confirmed != normal_t_detach + stable_detach_steps - 1:
-                raise ValueError(
-                    f"Normal detach confirmation mismatch: {pair['pair_id']}"
-                )
-            normal_goal_start = normal_t_goal_stable - post_detach_goal_stable_steps + 1
-            if normal_goal_start < normal_t_detach_confirmed:
-                raise ValueError(
-                    f"Normal post-detach goal window starts too early: "
-                    f"{pair['pair_id']}"
-                )
-            if bool(normal_result.get("normal_post_success_timeout")):
-                raise ValueError(
-                    f"Primary pair ended by normal observation timeout: "
-                    f"{pair['pair_id']}"
-                )
-            if normal_t_cmd >= len(actions[normal_num]):
-                raise ValueError(
-                    f"Normal t_cmd is outside its action rows: {pair['pair_id']}"
-                )
-            normal_open_action = np.asarray(
-                actions[normal_num][normal_t_cmd]["policy_libero_action"],
-                dtype=np.float64,
-            )
-            if abs(float(normal_open_action[-1]) - forced_gripper_value) > action_atol:
-                raise ValueError(
-                    f"Normal t_cmd is not a natural open action: {pair['pair_id']}"
-                )
-            normal_detach_checks[(normal_num, normal_t_detach)] = pair
-            for confirmation_step in range(
-                normal_t_detach, normal_t_detach_confirmed + 1
-            ):
-                normal_confirmation_checks[(normal_num, confirmation_step)] = pair
-            for goal_step in range(normal_goal_start, normal_t_goal_stable + 1):
-                normal_goal_checks[(normal_num, goal_step)] = pair
         prefix_metrics[pair["pair_id"]] = _validate_prefix(
             root,
             normal_result,
@@ -700,41 +614,8 @@ def validate_paired_release_run(
     seen_confirmation: set[tuple[int, int]] = set()
     seen_obs: set[str] = set()
     seen_contact: set[str] = set()
-    seen_normal_detach: set[str] = set()
-    seen_normal_confirmation: set[tuple[int, int]] = set()
-    seen_normal_goal: set[tuple[int, int]] = set()
     for row in _iter_jsonl(root / "trajectory_records.jsonl"):
         key = (int(row["episode_num"]), int(row["step_in_episode"]))
-        if key in normal_detach_checks:
-            pair = normal_detach_checks[key]
-            target = pair["target_object"]
-            if not target_grasped(row["pre"], target) or target_grasped(
-                row["post"], target
-            ):
-                raise ValueError(
-                    f"Normal t_detach is not grasp True->False: {pair['pair_id']}"
-                )
-            seen_normal_detach.add(pair["pair_id"])
-        if key in normal_confirmation_checks:
-            pair = normal_confirmation_checks[key]
-            if target_grasped(row["post"], pair["target_object"]):
-                raise ValueError(
-                    f"Normal object was regrasped inside detach confirmation: "
-                    f"{pair['pair_id']}"
-                )
-            seen_normal_confirmation.add(key)
-        if key in normal_goal_checks:
-            pair = normal_goal_checks[key]
-            goal_satisfied = (
-                row["post"].get("goals", {}).get("all_goal_predicates_satisfied")
-                is True
-            )
-            if not goal_satisfied or target_grasped(row["post"], pair["target_object"]):
-                raise ValueError(
-                    f"Normal post-detach goal window is not stable: "
-                    f"{pair['pair_id']}"
-                )
-            seen_normal_goal.add(key)
         if key in detach_checks:
             pair = detach_checks[key]
             target = pair["target_object"]
@@ -787,18 +668,6 @@ def validate_paired_release_run(
         if row["forced_release"].get("t_post_detach_destination_contact") is not None
     }:
         raise ValueError("Not every recorded fixture-contact time was verified")
-    primary_pair_ids = {
-        row["pair_id"]
-        for row in valid_pairs
-        if bool(row.get("primary_analysis_eligible"))
-    }
-    if seen_normal_detach != primary_pair_ids:
-        raise ValueError("Not every primary pair has a verified normal detach")
-    if seen_normal_confirmation != set(normal_confirmation_checks):
-        raise ValueError("Not every primary pair has a stable normal detach window")
-    if seen_normal_goal != set(normal_goal_checks):
-        raise ValueError("Not every primary pair has a stable post-detach goal window")
-
     return {
         **structural,
         "pair_candidates": len(pair_rows),

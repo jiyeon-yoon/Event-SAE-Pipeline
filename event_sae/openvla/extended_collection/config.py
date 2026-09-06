@@ -75,11 +75,6 @@ class PairedReleaseConfig:
     trigger_delay_steps: int = 0
     max_force_open_steps: int = 20
     stable_detach_steps: int = 2
-    # LIBERO's goal predicate can become true while the robot still holds the
-    # object. Keep the normal policy running briefly so its natural release is
-    # observed instead of ending on the first successful placement frame.
-    normal_post_success_steps: int = 20
-    post_detach_goal_stable_steps: int = 2
     forced_gripper_value: float = -1.0
     action_atol: float = 1e-6
     state_atol: float = 1e-6
@@ -232,12 +227,6 @@ def validate_paired_release_config(cfg: PairedReleaseRunConfig) -> None:
         raise ValueError("paired_release.max_force_open_steps must be positive")
     if paired.stable_detach_steps <= 0:
         raise ValueError("paired_release.stable_detach_steps must be positive")
-    if paired.normal_post_success_steps <= 0:
-        raise ValueError("paired_release.normal_post_success_steps must be positive")
-    if paired.post_detach_goal_stable_steps <= 0:
-        raise ValueError(
-            "paired_release.post_detach_goal_stable_steps must be positive"
-        )
     if paired.forced_gripper_value != -1.0:
         raise ValueError(
             "LIBERO paired release is fixed to forced_gripper_value=-1.0 (open)"
