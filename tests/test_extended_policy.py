@@ -88,6 +88,25 @@ def test_single_generation_decodes_action_and_drops_logits():
     assert output.model_input_rgb.shape == (224, 224, 3)
 
 
+def test_cached_normal_model_input_bypasses_preprocessing():
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(center_crop=True, checkpoint="openvla/test")
+    )
+    cached = np.full((224, 224, 3), 17, dtype=np.uint8)
+    output = infer_action_with_uncertainty(
+        FakeModel(),
+        FakeProcessor(),
+        cfg,
+        np.zeros((224, 224, 3), dtype=np.uint8),
+        "move object",
+        "libero_spatial",
+        model_input_rgb_override=cached,
+    )
+
+    assert np.array_equal(output.model_input_rgb, cached)
+    assert output.preprocessing["input_source"] == "normal_prefix_replay"
+
+
 def test_uncertainty_is_over_action_vocabulary_only():
     scores = (torch.tensor([[1000.0, -2.0, -1.0, 3.0, 2.0]]),)
     result = _summarize_action_scores(

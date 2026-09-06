@@ -83,7 +83,10 @@ STATEFUL_SIM_FIELDS = (
 
 @dataclass
 class PrefixTrace:
+    model_input_rgb: np.ndarray
     model_input_rgb_sha256: str
+    observed_source_rgb: np.ndarray
+    observed_source_rgb_sha256: str
     stateful_sim_sha256: str
     stateful_sim: dict[str, np.ndarray]
     raw_action: np.ndarray
@@ -96,7 +99,9 @@ class PrefixTrace:
 class PrefixComparison:
     steps_compared: int = 0
     rgb_exact: bool = True
+    observed_rgb_exact: bool = True
     stateful_sim_exact: bool = True
+    max_observed_rgb_abs_delta: float = 0.0
     max_raw_action_abs_delta: float = 0.0
     max_policy_action_abs_delta: float = 0.0
     max_qpos_abs_delta: float = 0.0
@@ -119,6 +124,9 @@ class PrefixComparison:
         policy_delta = _max_abs_delta(normal.policy_action, forced.policy_action)
         qpos_delta = _max_abs_delta(normal.qpos, forced.qpos)
         qvel_delta = _max_abs_delta(normal.qvel, forced.qvel)
+        observed_rgb_delta = _max_abs_delta(
+            normal.observed_source_rgb, forced.observed_source_rgb
+        )
         if set(normal.stateful_sim) != set(forced.stateful_sim):
             state_field, state_delta = "field_set", float("inf")
         else:
@@ -137,12 +145,19 @@ class PrefixComparison:
         )
         self.max_qpos_abs_delta = max(self.max_qpos_abs_delta, qpos_delta)
         self.max_qvel_abs_delta = max(self.max_qvel_abs_delta, qvel_delta)
+        self.max_observed_rgb_abs_delta = max(
+            self.max_observed_rgb_abs_delta, observed_rgb_delta
+        )
         self.max_stateful_sim_abs_delta = max(
             self.max_stateful_sim_abs_delta, state_delta
         )
         rgb_equal = normal.model_input_rgb_sha256 == forced.model_input_rgb_sha256
+        observed_rgb_equal = (
+            normal.observed_source_rgb_sha256 == forced.observed_source_rgb_sha256
+        )
         sim_equal = normal.stateful_sim_sha256 == forced.stateful_sim_sha256
         self.rgb_exact = self.rgb_exact and rgb_equal
+        self.observed_rgb_exact = self.observed_rgb_exact and observed_rgb_equal
         self.stateful_sim_exact = self.stateful_sim_exact and sim_equal
 
         mismatch = None
@@ -316,6 +331,36 @@ def _pair_id(suite: str, task_id: int, trial_idx: int, pair_seed: int) -> str:
     return f"{suite}-task{task_id:02d}-trial{trial_idx:03d}-seed{pair_seed}"
 
 
+def _pair_invalid_reasons(
+    normal: dict[str, Any],
+    forced: dict[str, Any],
+    forced_fatal: Exception | None,
+) -> tuple[list[str], dict[str, bool]]:
+    """Keep the primary rollout failure while recording exact-hash audit evidence."""
+
+    audit = {
+        "initial_state_exact": (
+            normal["initial_state_sha256"] == forced["initial_state_sha256"]
+        ),
+        "warm_start_sim_state_exact": (
+            normal["warm_start_sim_state_sha256"]
+            == forced["warm_start_sim_state_sha256"]
+        ),
+        "warm_start_source_rgb_exact": (
+            normal["warm_start_source_rgb_sha256"]
+            == forced["warm_start_source_rgb_sha256"]
+        ),
+    }
+    reasons = []
+    if forced["invalid_reason"] is not None:
+        reasons.append(str(forced["invalid_reason"]))
+    if not audit["initial_state_exact"]:
+        reasons.append("initial_state_hash_mismatch")
+    if forced_fatal is not None:
+        reasons.append("forced_exception")
+    return reasons, audit
+
+
 def _reset_to_initial_state(
     env,
     initial_state: np.ndarray,
@@ -333,12 +378,16 @@ def _reset_to_initial_state(
 
 def _trace(
     model_input_rgb: np.ndarray,
+    observed_source_rgb: np.ndarray,
     raw_action: np.ndarray,
     policy_action: np.ndarray,
     pre_vectors: dict[str, np.ndarray],
 ) -> PrefixTrace:
     return PrefixTrace(
+        model_input_rgb=np.asarray(model_input_rgb, dtype=np.uint8).copy(),
         model_input_rgb_sha256=array_sha256(model_input_rgb),
+        observed_source_rgb=np.asarray(observed_source_rgb, dtype=np.uint8).copy(),
+        observed_source_rgb_sha256=array_sha256(observed_source_rgb),
         stateful_sim_sha256=_sim_state_sha256(pre_vectors),
         stateful_sim={
             name: np.asarray(pre_vectors[name]).copy()
@@ -502,6 +551,19 @@ def _run_episode(
             ):
                 t_obs = int(step)
 
+            reference = None
+            model_input_rgb_override = None
+            policy_input_source = "observed"
+            if condition == FORCED_RELEASE_CONDITION and step <= int(
+                scheduled_trigger_step
+            ):
+                reference = normal_trace.get(step)
+                if reference is None:
+                    invalid_reason = "normal_prefix_step_missing"
+                else:
+                    model_input_rgb_override = reference.model_input_rgb
+                    policy_input_source = "normal_prefix_replay"
+
             common = {
                 "episode_num": episode_num,
                 "pair_id": pair_id,
@@ -511,6 +573,7 @@ def _run_episode(
                 "task_episode_idx": trial_idx,
                 "task_description": description,
                 "step_in_episode": step,
+                "policy_input_source": policy_input_source,
             }
             activation_collector.begin_step(common)
             transaction_started = True
@@ -521,11 +584,13 @@ def _run_episode(
                 source_rgb,
                 description,
                 unnorm_key,
+                model_input_rgb_override=model_input_rgb_override,
             )
             raw_action = np.asarray(policy_out.raw_action).copy()
             policy_action = to_executed_libero_action(raw_action)
             current_trace = _trace(
                 policy_out.model_input_rgb,
+                source_rgb,
                 raw_action,
                 policy_action,
                 pre.sim_vectors,
@@ -546,11 +611,8 @@ def _run_episode(
                 ):
                     t_cmd = int(step)
             else:
-                reference = normal_trace.get(step)
                 if step <= int(scheduled_trigger_step):
-                    if reference is None:
-                        invalid_reason = "normal_prefix_step_missing"
-                    elif not comparison.compare(
+                    if reference is not None and not comparison.compare(
                         step,
                         reference,
                         current_trace,
@@ -681,6 +743,7 @@ def _run_episode(
                     "preprocessing": policy_out.preprocessing,
                 },
                 model_input_rgb=policy_out.model_input_rgb,
+                observed_source_rgb=source_rgb,
                 reward=float(reward),
                 done=bool(done),
                 info=_safe_info(info),
@@ -846,7 +909,7 @@ def collect_paired_release_libero(
         f"{cfg.env.task_suite_name}-paired-release",
     )
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v5",
+        "schema_version": "extended_openvla_libero_paired_release_v6",
         "collection_status": "in_progress",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "code": _git_state(repo_root),
@@ -868,6 +931,11 @@ def collect_paired_release_libero(
                 cfg.paired_release.target_primary_pairs_per_task
             ),
             "prefix_comparison_includes_trigger_step": True,
+            "prefix_policy_input": (
+                "replay exact normal model_input_rgb through trigger; retain "
+                "forced observed_source_rgb separately for audit"
+            ),
+            "warm_start_hashes": "audit_only",
             "detach_confirmation_steps": cfg.paired_release.stable_detach_steps,
             "normal_termination": "official_libero_success_or_horizon",
             "primary_analysis_filter": "valid_pair and normal_success",
@@ -1147,24 +1215,10 @@ def collect_paired_release_libero(
                             forced["success"],
                         )
 
-                        invalid_reason = forced["invalid_reason"]
-                        if (
-                            normal["initial_state_sha256"]
-                            != forced["initial_state_sha256"]
-                        ):
-                            invalid_reason = "initial_state_hash_mismatch"
-                        elif (
-                            normal["warm_start_sim_state_sha256"]
-                            != forced["warm_start_sim_state_sha256"]
-                        ):
-                            invalid_reason = "warm_start_sim_state_mismatch"
-                        elif (
-                            normal["warm_start_source_rgb_sha256"]
-                            != forced["warm_start_source_rgb_sha256"]
-                        ):
-                            invalid_reason = "warm_start_source_rgb_mismatch"
-                        if forced_fatal is not None and invalid_reason is None:
-                            invalid_reason = "forced_exception"
+                        invalid_reasons, pairing_audit = _pair_invalid_reasons(
+                            normal, forced, forced_fatal
+                        )
+                        invalid_reason = invalid_reasons[0] if invalid_reasons else None
                         valid = invalid_reason is None
                         status = "valid" if valid else "invalid"
                         aggregate["valid_pairs" if valid else "invalid_pairs"] += 1
@@ -1183,6 +1237,8 @@ def collect_paired_release_libero(
                             "valid": valid,
                             "skip_reason": None,
                             "invalid_reason": invalid_reason,
+                            "invalid_reasons": invalid_reasons,
+                            "pairing_audit": pairing_audit,
                             "task_id": task_id,
                             "task_episode_idx": trial_idx,
                             "pair_seed": pair_seed,

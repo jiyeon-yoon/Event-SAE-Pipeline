@@ -98,7 +98,7 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
     }
     policy_action = np.asarray([0.1, 0, 0, 0, 0, 0, 1.0])
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v5",
+        "schema_version": "extended_openvla_libero_paired_release_v6",
         "collection_status": "complete",
         "activation_stream": {"layer": 31, "forwards_per_policy_step": 7},
         "policy_uncertainty": {
@@ -160,8 +160,17 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                     grasped=post_grasped,
                     goal_satisfied=normal_goal,
                 )
+                policy_input_source = (
+                    "normal_prefix_replay"
+                    if condition == "forced_release" and step <= 1
+                    else "observed"
+                )
                 writer.write_step(
-                    common={**common_identity, "step_in_episode": step},
+                    common={
+                        **common_identity,
+                        "step_in_episode": step,
+                        "policy_input_source": policy_input_source,
+                    },
                     pre_json=pre,
                     post_json=post,
                     pre_vectors=vectors,
@@ -179,6 +188,11 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                     },
                     policy=_uncertainty(),
                     model_input_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+                    observed_source_rgb=np.full(
+                        (224, 224, 3),
+                        1 if condition == "forced_release" else 0,
+                        dtype=np.uint8,
+                    ),
                     reward=0.0,
                     done=(condition == "normal" and primary and step == 3),
                     info={},
@@ -186,9 +200,7 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
             result = {
                 **common_identity,
                 "success": condition == "normal" and primary,
-                "success_step": (
-                    3 if condition == "normal" and primary else None
-                ),
+                "success_step": (3 if condition == "normal" and primary else None),
                 "initial_state_sha256": prompt["initial_state_sha256"],
                 "trigger": {"trigger_step": 1, "initial_object_z": 0.0},
                 "t_cmd": 1 if condition == "forced_release" else None,
@@ -197,8 +209,8 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                 "t_obs": None,
                 "t_post_detach_destination_contact": None,
                 "invalid_reason": None,
-                "warm_start_sim_state_sha256": "same-sim",
-                "warm_start_source_rgb_sha256": "same-rgb",
+                "warm_start_sim_state_sha256": f"{condition}-sim",
+                "warm_start_source_rgb_sha256": f"{condition}-rgb",
             }
             episode_results[condition] = writer.finish_episode(
                 result=result,
@@ -213,6 +225,12 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                 "valid": True,
                 "skip_reason": None,
                 "invalid_reason": None,
+                "invalid_reasons": [],
+                "pairing_audit": {
+                    "initial_state_exact": True,
+                    "warm_start_sim_state_exact": False,
+                    "warm_start_source_rgb_exact": False,
+                },
                 "task_id": 0,
                 "task_episode_idx": 0,
                 "pair_seed": 0,
@@ -249,6 +267,11 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                         "episode_num": episode_num,
                         "pair_id": PAIR_ID,
                         "condition": condition,
+                        "policy_input_source": (
+                            "normal_prefix_replay"
+                            if condition == "forced_release" and step <= 1
+                            else "observed"
+                        ),
                         "pair_seed": 0,
                         "task_id": 0,
                         "task_episode_idx": 0,
@@ -328,6 +351,41 @@ def test_paired_validator_checks_matched_prefix_and_gripper_only(tmp_path: Path)
     assert summary["valid_pairs"] == 1
     assert summary["ineligible_pairs"] == 0
     assert summary["prefix_metrics"][PAIR_ID]["rgb_exact"] is True
+    assert summary["prefix_metrics"][PAIR_ID]["observed_rgb_exact"] is False
+    assert summary["prefix_metrics"][PAIR_ID]["max_observed_rgb_abs_delta"] == 1.0
+
+
+def test_paired_validator_rejects_wrong_prefix_input_provenance(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    path = run_dir / "action_records.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    row = next(
+        item
+        for item in rows
+        if item["condition"] == "forced_release" and item["step_in_episode"] == 0
+    )
+    row["policy_input_source"] = "observed"
+    path.write_text("".join(json.dumps(item) + "\n" for item in rows), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input provenance"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_validator_rejects_noncanonical_model_input(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    result_rows = [
+        json.loads(line)
+        for line in (run_dir / "episode_results.jsonl").read_text().splitlines()
+    ]
+    forced = next(row for row in result_rows if row["condition"] == "forced_release")
+    vision_path = run_dir / forced["vision_path"]
+    with np.load(vision_path) as archive:
+        payload = {name: archive[name].copy() for name in archive.files}
+    payload["model_input_rgb"][0, 0, 0, 0] = 1
+    np.savez_compressed(vision_path, **payload)
+
+    with pytest.raises(ValueError, match="model-input RGB differs"):
+        validate_paired_release_run(run_dir)
 
 
 def test_paired_validator_accepts_successful_control_as_primary(tmp_path: Path):
@@ -343,9 +401,7 @@ def test_paired_validator_rejects_success_without_trajectory_done(tmp_path: Path
     for row in rows:
         if row["condition"] == "normal":
             row["done"] = False
-    path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-    )
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
     with pytest.raises(ValueError, match="success differs from trajectory done"):
         validate_paired_release_run(run_dir)

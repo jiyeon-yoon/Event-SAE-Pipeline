@@ -53,6 +53,7 @@ class EpisodeBuffer:
     sim_post: Dict[str, list[np.ndarray]] = field(default_factory=dict)
     step_ids: list[int] = field(default_factory=list)
     model_input_rgb: list[np.ndarray] = field(default_factory=list)
+    observed_source_rgb: list[np.ndarray] = field(default_factory=list)
 
     def add(
         self,
@@ -60,7 +61,8 @@ class EpisodeBuffer:
         pre_vectors: Dict[str, np.ndarray],
         post_vectors: Dict[str, np.ndarray],
         model_input_rgb: np.ndarray | None,
-    ) -> tuple[int, int | None]:
+        observed_source_rgb: np.ndarray | None,
+    ) -> tuple[int, int | None, int | None]:
         sim_row = len(self.step_ids)
         self.step_ids.append(int(step_in_episode))
         for key, value in pre_vectors.items():
@@ -73,7 +75,13 @@ class EpisodeBuffer:
             self.model_input_rgb.append(
                 np.asarray(model_input_rgb, dtype=np.uint8).copy()
             )
-        return sim_row, vision_row
+        observed_vision_row = None
+        if observed_source_rgb is not None:
+            observed_vision_row = len(self.observed_source_rgb)
+            self.observed_source_rgb.append(
+                np.asarray(observed_source_rgb, dtype=np.uint8).copy()
+            )
+        return sim_row, vision_row, observed_vision_row
 
 
 class ExtendedRunWriter:
@@ -178,12 +186,17 @@ class ExtendedRunWriter:
         reward: float,
         done: bool,
         info: Dict[str, Any],
+        observed_source_rgb: np.ndarray | None = None,
     ) -> None:
         if self._buffer is None:
             raise RuntimeError("begin_episode must be called before write_step")
         step_id = int(common["step_in_episode"])
-        sim_row, vision_row = self._buffer.add(
-            step_id, pre_vectors, post_vectors, model_input_rgb
+        sim_row, vision_row, observed_vision_row = self._buffer.add(
+            step_id,
+            pre_vectors,
+            post_vectors,
+            model_input_rgb,
+            observed_source_rgb,
         )
         policy_action = (
             np.asarray(executed_action)
@@ -196,6 +209,7 @@ class ExtendedRunWriter:
             "alignment": "pre_state + action -> post_state",
             "sim_state_row": sim_row,
             "model_input_rgb_row": vision_row,
+            "observed_source_rgb_row": observed_vision_row,
             "pre": pre_json,
             "post": post_json,
             "raw_openvla_action": np.asarray(raw_action),
@@ -251,15 +265,26 @@ class ExtendedRunWriter:
         save(sim_path, **sim_payload)
 
         vision_path: Path | None = None
-        if buffer.model_input_rgb:
+        if buffer.model_input_rgb or buffer.observed_source_rgb:
             vision_path = (
                 self.run_dir / "vision" / f"episode_{buffer.episode_num:06d}.npz"
             )
-            save(
-                vision_path,
-                step_in_episode=np.asarray(buffer.step_ids, dtype=np.int32),
-                model_input_rgb=np.stack(buffer.model_input_rgb).astype(np.uint8),
-            )
+            vision_payload: Dict[str, Any] = {
+                "step_in_episode": np.asarray(buffer.step_ids, dtype=np.int32)
+            }
+            if buffer.model_input_rgb:
+                if len(buffer.model_input_rgb) != len(buffer.step_ids):
+                    raise RuntimeError("model_input_rgb is not step-aligned")
+                vision_payload["model_input_rgb"] = np.stack(
+                    buffer.model_input_rgb
+                ).astype(np.uint8)
+            if buffer.observed_source_rgb:
+                if len(buffer.observed_source_rgb) != len(buffer.step_ids):
+                    raise RuntimeError("observed_source_rgb is not step-aligned")
+                vision_payload["observed_source_rgb"] = np.stack(
+                    buffer.observed_source_rgb
+                ).astype(np.uint8)
+            save(vision_path, **vision_payload)
         final = dict(result)
         final.update(
             {

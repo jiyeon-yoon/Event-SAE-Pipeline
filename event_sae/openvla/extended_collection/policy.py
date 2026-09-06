@@ -239,15 +239,37 @@ def infer_action_with_uncertainty(
     source_rgb: np.ndarray,
     task_label: str,
     unnorm_key: str,
+    *,
+    model_input_rgb_override: np.ndarray | None = None,
 ) -> PolicyOutput:
     """Generate once, decode exactly like OpenVLA, and retain only summaries."""
 
     import torch
     from PIL import Image
 
-    model_rgb, preprocessing = _prepare_model_input_rgb(
-        source_rgb, center_crop=bool(cfg.model.center_crop)
-    )
+    if model_input_rgb_override is None:
+        model_rgb, preprocessing = _prepare_model_input_rgb(
+            source_rgb, center_crop=bool(cfg.model.center_crop)
+        )
+        preprocessing["input_source"] = "observed"
+    else:
+        model_rgb = np.asarray(model_input_rgb_override, dtype=np.uint8)
+        if model_rgb.shape != (224, 224, 3):
+            raise ValueError(
+                "model_input_rgb_override must have shape (224, 224, 3), "
+                f"got {model_rgb.shape}"
+            )
+        model_rgb = model_rgb.copy()
+        preprocessing = {
+            "source": "cached normal-condition model input",
+            "source_shape": list(model_rgb.shape),
+            "source_dtype": str(model_rgb.dtype),
+            "center_crop": bool(cfg.model.center_crop),
+            "crop_scale": 0.9 if cfg.model.center_crop else 1.0,
+            "output_shape": [224, 224, 3],
+            "output_dtype": "uint8",
+            "input_source": "normal_prefix_replay",
+        }
     prompt = _build_prompt(task_label, cfg.model.checkpoint)
     device = _model_device(model)
     inputs = processor(prompt, Image.fromarray(model_rgb).convert("RGB"))

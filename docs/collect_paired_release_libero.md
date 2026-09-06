@@ -3,6 +3,9 @@
 이 수집기는 기존 Event-SAE 수집기를 수정하거나 호출하지 않는다. 같은
 LIBERO initial state와 seed에서 `normal`을 먼저 실행한 뒤, 안정적인
 grasp+lift가 확인된 시점에 gripper만 강제로 여는 `forced_release`를 실행한다.
+렌더러의 미세한 비결정성이 정책 행동을 바꾸지 않도록 forced 조건은 trigger
+시점까지 normal의 model-input RGB를 그대로 재사용한다. forced 환경에서 실제로
+관측된 RGB는 별도로 저장하며, simulator state 차이는 허용오차 안인지 검증한다.
 
 한 번의 수집으로 normal/premature release 비교, Layer 31 raw-hidden probe,
 SAE Top-K와 시간 지표, object/contact/reward/predicate 기반 실패 분석에 필요한
@@ -34,7 +37,7 @@ release는 primary 필수 조건이 아니며, `t_cmd`·`t_detach`·`t_obs`의 �
 | qpos·qvel·act·ctrl·force·sensor 등 지정된 simulator vector의 step 전/후 값 | 두 조건의 intervention 이전 동역학이 같은지 검증하고 후처리 분석 |
 | raw OpenVLA action, LIBERO 변환 action, 실제 실행 action, gripper override | 강제-release에서 gripper만 바뀌었는지 확인하고 행동 변화 추적 |
 | token ID와 entropy·top-1 probability·margin 등 요약값 | OpenVLA의 256개 action token 전체에서 full logits 없이 정책 불확실성 분석 |
-| model-input RGB와 rollout MP4 | 물리 이벤트를 실제 장면 및 시간축과 함께 확인 |
+| 정책에 전달한 model-input RGB, 실제 관측 source RGB, rollout MP4 | 동일 policy prefix를 보장하면서 실제 장면 차이도 별도로 감사·확인 |
 | Layer 31 dense hidden과 episode/condition/step/forward→shard index | raw-hidden probe, SAE Top-K, event 주변 feature와 시간 지표를 재수집 없이 계산 |
 
 `subgoal`은 순서가 붙은 별도 라벨이 아니라 **BDDL predicate별 만족 상태**로
@@ -56,6 +59,9 @@ feature intervention 결과는 정책을 다시 실행해야 하므로 별도 ro
 | summary·pair·episode·trajectory 교차검증 | `success`/`success_step`이 simulator `done`과 다른데 quota가 거짓 통과하는 문제 방지 |
 | 목표 미달 시 실패 상태·완료 마커 미생성 | 불완전 데이터를 정상 완료본으로 업로드·사용하지 않기 위해 |
 | 전체 10개 task smoke test | 본 수집 전에 task별 trigger, normal 성공, 강제 detach, 저장 구조 문제 확인 |
+| trigger까지 normal model-input RGB 재사용 | reset 후 RGB 재렌더링 차이가 intervention 전 OpenVLA action을 바꾸는 문제 방지 |
+| 실제 forced source RGB 별도 저장 + simulator state tolerance 검증 | 정책 입력 고정이 실제 물리 상태 차이를 숨기지 않도록 감사 가능하게 보존 |
+| warm-start RGB/state hash를 audit-only로 기록 | 부동소수점·렌더링의 무의미한 exact-hash 차이로 올바른 pair를 폐기하지 않기 위해 |
 
 현재 본 수집의 task별 `valid=20`, `primary=20`은 논문이 보장한 표본 수가
 아니라 **분석 가능한 최소 cohort를 확보하기 위한 품질 gate**다. 목표 충족 시
@@ -94,6 +100,7 @@ python -m pytest -q \
   tests/test_controlled_release.py \
   tests/test_paired_pair_quota.py \
   tests/test_paired_release_config.py \
+  tests/test_canonical_prefix_replay.py \
   tests/test_paired_release_validator.py
 ```
 
@@ -162,7 +169,7 @@ python scripts/openvla/validate_paired_release_dataset.py \
 raw record·task별 quota·semantic validation이 모두 통과한 경우에만
 manifest와 `COLLECTION_COMPLETE`를 완료 처리한다.
 `--finalize-incomplete`는 저장된 값을 수정하지 않는다. 이전 v4의
-255-token uncertainty는 복구할 수 없으므로, v5로 1-pair smoke를 다시
+255-token uncertainty는 복구할 수 없으므로, v6로 1-pair smoke를 다시
 통과한 후에만 본 수집을 시작한다.
 
 ## 3. 전체 수집과 업로드
@@ -244,8 +251,8 @@ done
 - `pair_results.jsonl`: pair 유효성, trigger, t_cmd/t_detach/t_obs
 - `summary.json`: task별 시도·valid·primary 수와 목표 달성 여부
 - `trajectory_records.jsonl`: object·robot·contact·grasp·reward·predicate
-- `action_records.jsonl`: raw, policy, 실제 action과 gripper override
+- `action_records.jsonl`: raw, policy, 실제 action, gripper override, policy-input 출처
 - `policy_uncertainty.jsonl`: 256개 action-token 기준 entropy, top probability, margin
-- `initial_states/`, `sim_state/`, `vision/`, `videos/`
+- `initial_states/`, `sim_state/`, `vision/`, `videos/` (`vision`에는 policy input과 실제 관측 RGB를 함께 저장)
 - `sae_activations/post_mlp_residual/`: Layer 31 dense activation과 step index
 - `COLLECTION_COMPLETE`: 정상 완료된 run에만 생성

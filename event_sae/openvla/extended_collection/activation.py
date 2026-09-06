@@ -67,6 +67,7 @@ class Layer31ActivationCollector:
                 "pair_id": context.get("pair_id"),
                 "condition": context.get("condition"),
                 "pair_seed": context.get("pair_seed"),
+                "policy_input_source": context.get("policy_input_source"),
                 "global_forward_idx": self._forward_id,
                 "tokens_in_forward": row_count,
             }

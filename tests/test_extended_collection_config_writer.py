@@ -58,6 +58,7 @@ def test_writer_preserves_pre_action_post_alignment(tmp_path: Path):
             executed_action=np.ones(7),
             policy={"entropy_mean_nats": 1.0},
             model_input_rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+            observed_source_rgb=np.ones((2, 2, 3), dtype=np.uint8),
             reward=0.0,
             done=False,
             info={},
@@ -75,3 +76,4 @@ def test_writer_preserves_pre_action_post_alignment(tmp_path: Path):
     assert sim["post_qpos"].tolist() == [[0.1, 1.1]]
     vision = np.load(tmp_path / "run" / "vision" / "episode_000001.npz")
     assert vision["model_input_rgb"].shape == (1, 2, 2, 3)
+    assert vision["observed_source_rgb"].tolist() == [np.ones((2, 2, 3)).tolist()]

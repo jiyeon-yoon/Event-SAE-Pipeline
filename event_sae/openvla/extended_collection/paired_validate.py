@@ -20,7 +20,8 @@ from event_sae.openvla.extended_collection.controlled_release import (
 from event_sae.openvla.extended_collection.validate import validate_extended_run
 
 
-PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v5"
+PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v6"
+LEGACY_PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v5"
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -102,6 +103,7 @@ def _validate_prefix(
     action_rows: dict[int, list[dict[str, Any]]],
     action_atol: float,
     state_atol: float,
+    require_observed_rgb: bool,
 ) -> dict[str, float | bool]:
     count = through_step + 1
     normal_actions = action_rows[int(normal_result["episode_num"])]
@@ -166,8 +168,22 @@ def _validate_prefix(
     )
     if not rgb_equal:
         raise ValueError("Normal/forced model-input RGB differs before intervention")
+    observed_rgb_equal = True
+    observed_rgb_delta = 0.0
+    if require_observed_rgb:
+        if (
+            "observed_source_rgb" not in normal_vision
+            or "observed_source_rgb" not in forced_vision
+        ):
+            raise ValueError("Paired v6 vision data lacks observed_source_rgb")
+        observed_normal = normal_vision["observed_source_rgb"][:count]
+        observed_forced = forced_vision["observed_source_rgb"][:count]
+        observed_rgb_equal = np.array_equal(observed_normal, observed_forced)
+        observed_rgb_delta = _max_delta(observed_normal, observed_forced)
     return {
         "rgb_exact": rgb_equal,
+        "observed_rgb_exact": observed_rgb_equal,
+        "max_observed_rgb_abs_delta": observed_rgb_delta,
         "max_raw_action_abs_delta": raw_delta,
         "max_policy_action_abs_delta": policy_delta,
         "max_qpos_abs_delta": qpos_delta,
@@ -184,6 +200,7 @@ def _validate_actions(
     forced_actions: list[dict[str, Any]],
     *,
     action_atol: float,
+    require_policy_input_provenance: bool,
 ) -> None:
     for row in normal_actions:
         policy = np.asarray(row["policy_libero_action"], dtype=np.float64)
@@ -197,6 +214,13 @@ def _validate_actions(
             raise ValueError(
                 f"Normal row has a non-none intervention type: {pair['pair_id']}"
             )
+        if (
+            require_policy_input_provenance
+            and row.get("policy_input_source") != "observed"
+        ):
+            raise ValueError(
+                f"Normal row has invalid policy input provenance: {pair['pair_id']}"
+            )
 
     t_cmd = int(pair["forced_release"]["t_cmd"])
     t_detach = int(pair["forced_release"]["t_detach"])
@@ -208,6 +232,13 @@ def _validate_actions(
         executed = np.asarray(row["executed_libero_action"], dtype=np.float64)
         intervention = row.get("intervention", {})
         applied = bool(intervention.get("forced_open_applied"))
+        if require_policy_input_provenance:
+            expected_source = "normal_prefix_replay" if step <= t_cmd else "observed"
+            if row.get("policy_input_source") != expected_source:
+                raise ValueError(
+                    "Forced row has invalid policy input provenance: "
+                    f"{pair['pair_id']} step={step}"
+                )
         if intervention.get("type") != "forced_gripper_open":
             raise ValueError(
                 f"Forced row lacks intervention identity: {pair['pair_id']} "
@@ -249,8 +280,13 @@ def validate_paired_release_run(
 
     root = Path(run_dir).expanduser().resolve()
     manifest = _json(root / "manifest.json")
-    if manifest.get("schema_version") != PAIRED_SCHEMA_VERSION:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in (
+        PAIRED_SCHEMA_VERSION,
+        LEGACY_PAIRED_SCHEMA_VERSION,
+    ):
         raise ValueError("Unexpected paired-release dataset schema")
+    canonical_prefix_replay = schema_version == PAIRED_SCHEMA_VERSION
     collection_status = manifest.get("collection_status")
     if require_complete:
         if collection_status != "complete":
@@ -372,7 +408,7 @@ def validate_paired_release_run(
     expected_episodes = expected_candidates + len(eligible)
     structural = validate_extended_run(
         root,
-        expected_schema_version=PAIRED_SCHEMA_VERSION,
+        expected_schema_version=schema_version,
         expected_episode_count=expected_episodes,
     )
 
@@ -568,6 +604,14 @@ def validate_paired_release_run(
         _assert_episode_identity(
             row, expected_by_episode[episode_num], source="activation_index"
         )
+        if canonical_prefix_replay:
+            step = int(row["step_in_episode"])
+            expected_source = actions[episode_num][step].get("policy_input_source")
+            if row.get("policy_input_source") != expected_source:
+                raise ValueError(
+                    "Activation/policy input provenance differs: "
+                    f"episode={episode_num} step={step}"
+                )
 
     valid_pairs = [row for row in eligible if bool(row.get("valid"))]
     detach_checks: dict[tuple[int, int], dict[str, Any]] = {}
@@ -597,11 +641,31 @@ def validate_paired_release_run(
             "warm_start_sim_state_sha256",
             "warm_start_source_rgb_sha256",
         ):
-            if not normal_result.get(field) or normal_result.get(
+            if not normal_result.get(field) or not forced_result.get(field):
+                raise ValueError(
+                    f"Paired warm-start evidence is missing: {pair['pair_id']} {field}"
+                )
+            if not canonical_prefix_replay and normal_result.get(
                 field
             ) != forced_result.get(field):
                 raise ValueError(
-                    f"Paired warm-start evidence differs: " f"{pair['pair_id']} {field}"
+                    f"Paired warm-start evidence differs: {pair['pair_id']} {field}"
+                )
+        if canonical_prefix_replay:
+            expected_audit = {
+                "initial_state_exact": True,
+                "warm_start_sim_state_exact": (
+                    normal_result["warm_start_sim_state_sha256"]
+                    == forced_result["warm_start_sim_state_sha256"]
+                ),
+                "warm_start_source_rgb_exact": (
+                    normal_result["warm_start_source_rgb_sha256"]
+                    == forced_result["warm_start_source_rgb_sha256"]
+                ),
+            }
+            if pair.get("pairing_audit") != expected_audit:
+                raise ValueError(
+                    f"Pairing audit does not match raw evidence: {pair['pair_id']}"
                 )
         t_cmd = pair["forced_release"].get("t_cmd")
         t_detach = pair["forced_release"].get("t_detach")
@@ -638,6 +702,7 @@ def validate_paired_release_run(
             actions[normal_num],
             actions[forced_num],
             action_atol=action_atol,
+            require_policy_input_provenance=canonical_prefix_replay,
         )
         prefix_metrics[pair["pair_id"]] = _validate_prefix(
             root,
@@ -647,6 +712,7 @@ def validate_paired_release_run(
             action_rows=actions,
             action_atol=action_atol,
             state_atol=state_atol,
+            require_observed_rgb=canonical_prefix_replay,
         )
         detach_checks[(forced_num, t_detach)] = pair
         for confirmation_step in range(t_detach, t_detach_confirmed + 1):
@@ -747,9 +813,7 @@ def finalize_paired_release_run(
             min_primary_pairs_per_task=min_primary_pairs_per_task,
         )
     if status != "in_progress":
-        raise ValueError(
-            f"Only an in-progress run can be finalized; found {status!r}"
-        )
+        raise ValueError(f"Only an in-progress run can be finalized; found {status!r}")
     if marker_path.exists():
         raise ValueError("Incomplete manifest unexpectedly has COLLECTION_COMPLETE")
 
@@ -772,9 +836,7 @@ def finalize_paired_release_run(
 
     def write_manifest(value: dict[str, Any]) -> None:
         temporary = root / "manifest.json.tmp"
-        temporary.write_text(
-            json.dumps(value, indent=2) + "\n", encoding="utf-8"
-        )
+        temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
         temporary.replace(manifest_path)
 
     write_manifest(completed_manifest)
