@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from event_sae.openvla.extended_collection.paired_validate import (  # noqa: E402
+    finalize_paired_release_run,
     validate_paired_release_run,
 )
 
@@ -31,13 +32,28 @@ def main() -> None:
         default=None,
         help="Optional stricter primary-cohort threshold; cannot weaken the manifest",
     )
+    parser.add_argument(
+        "--finalize-incomplete",
+        action="store_true",
+        help=(
+            "Finalize an intact in-progress run that stopped only during "
+            "post-collection validation"
+        ),
+    )
     args = parser.parse_args()
-    summary = validate_paired_release_run(
+    validator = (
+        finalize_paired_release_run
+        if args.finalize_incomplete
+        else validate_paired_release_run
+    )
+    summary = validator(
         args.run_dir,
         min_valid_pairs_per_task=args.min_valid_pairs_per_task,
         min_primary_pairs_per_task=args.min_primary_pairs_per_task,
     )
     print(json.dumps(summary, indent=2))
+    if args.finalize_incomplete:
+        print(f"PAIRED_RELEASE_DATASET_FINALIZED: {Path(args.run_dir).resolve()}")
     print(f"PAIRED_RELEASE_DATASET_OK: {Path(args.run_dir).resolve()}")
 
 

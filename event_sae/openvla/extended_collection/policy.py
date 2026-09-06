@@ -92,6 +92,12 @@ def _model_device(model):
             return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def _clamp_probability(value: float) -> float:
+    """Clamp float-reduction roundoff to the mathematical probability range."""
+
+    return min(1.0, max(0.0, float(value)))
+
+
 def _summarize_action_scores(
     scores,
     token_ids: list[int],
@@ -118,6 +124,9 @@ def _summarize_action_scores(
             full_probabilities * torch.log(full_probabilities.clamp_min(1e-12))
         ).sum()
         action_probability_mass = full_probabilities[start:action_vocab_end].sum()
+        stored_action_probability_mass = _clamp_probability(
+            action_probability_mass.item()
+        )
         conditional = full_probabilities[
             start:action_vocab_end
         ] / action_probability_mass.clamp_min(1e-12)
@@ -155,8 +164,8 @@ def _summarize_action_scores(
                     ),
                 },
                 "conditional_action_token": {
-                    "probability_mass_in_full_vocabulary": float(
-                        action_probability_mass.item()
+                    "probability_mass_in_full_vocabulary": (
+                        stored_action_probability_mass
                     ),
                     "entropy_nats": float(action_entropy.item()),
                     "normalized_entropy": float(action_entropy.item())

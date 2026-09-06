@@ -3,12 +3,16 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from event_sae.openvla.extended_collection.validate import validate_extended_run
+from event_sae.openvla.extended_collection.validate import (
+    _validate_uncertainty,
+    validate_extended_run,
+)
 from event_sae.openvla.extended_collection.writer import ExtendedRunWriter
 
 
@@ -72,6 +76,24 @@ def uncertainty():
         "action_token_ids": [32000] * 7,
         "uncertainty": {"per_action_dimension": dimensions},
     }
+
+
+def test_uncertainty_validator_allows_float32_probability_roundoff():
+    row = uncertainty()
+    row["uncertainty"]["per_action_dimension"][0]["conditional_action_token"][
+        "probability_mass_in_full_vocabulary"
+    ] = 1.0 + float(np.finfo(np.float32).eps)
+    _validate_uncertainty(row, (1, 0))
+
+
+@pytest.mark.parametrize("mass", [1.001, -0.001])
+def test_uncertainty_validator_rejects_material_probability_error(mass: float):
+    row = uncertainty()
+    row["uncertainty"]["per_action_dimension"][0]["conditional_action_token"][
+        "probability_mass_in_full_vocabulary"
+    ] = mass
+    with pytest.raises(ValueError, match="probability mass"):
+        _validate_uncertainty(row, (1, 0))
 
 
 def test_validator_connects_episode_step_rgb_sim_and_activation(tmp_path: Path):

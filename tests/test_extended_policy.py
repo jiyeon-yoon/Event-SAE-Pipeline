@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from event_sae.openvla.extended_collection.policy import (  # noqa: E402
+    _clamp_probability,
     _summarize_action_scores,
     infer_action_with_uncertainty,
 )
@@ -90,3 +91,8 @@ def test_uncertainty_is_over_action_vocabulary_only():
     assert row["selected_token_conditional_rank"] == 1
     assert row["conditional_action_token"]["probability_mass_in_full_vocabulary"] < 1e-6
     assert result["action_vocab_start"] == 3
+
+
+def test_probability_mass_roundoff_is_clamped():
+    assert _clamp_probability(1.0 + torch.finfo(torch.float32).eps) == 1.0
+    assert _clamp_probability(-torch.finfo(torch.float32).eps) == 0.0

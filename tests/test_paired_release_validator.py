@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from event_sae.openvla.extended_collection.paired_validate import (
+    finalize_paired_release_run,
     validate_paired_release_run,
 )
 from event_sae.openvla.extended_collection.writer import ExtendedRunWriter
@@ -401,6 +402,23 @@ def test_paired_validator_can_run_before_completion_marker(tmp_path: Path):
     with pytest.raises(ValueError, match="not marked complete"):
         validate_paired_release_run(run_dir)
     summary = validate_paired_release_run(run_dir, require_complete=False)
+    assert summary["valid_pairs"] == 1
+
+
+def test_paired_finalizer_salvages_valid_in_progress_run(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    (run_dir / "COLLECTION_COMPLETE").unlink()
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["collection_status"] = "in_progress"
+    manifest.pop("summary")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = finalize_paired_release_run(run_dir)
+
+    completed = json.loads(manifest_path.read_text())
+    assert completed["collection_status"] == "complete"
+    assert (run_dir / "COLLECTION_COMPLETE").is_file()
     assert summary["valid_pairs"] == 1
 
 

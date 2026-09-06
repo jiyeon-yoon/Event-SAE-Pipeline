@@ -166,7 +166,16 @@ def _validate_uncertainty(row: dict[str, Any], key: tuple[int, int]) -> None:
         mass = dimension["conditional_action_token"].get(
             "probability_mass_in_full_vocabulary"
         )
-        if not _finite_vector(mass, size=1) or not 0.0 <= float(mass) <= 1.0:
+        # Float32 probability reductions can land a few ULPs outside [0, 1].
+        # Accept numerical roundoff in existing datasets; the writer clamps
+        # this summary for all new collections.
+        probability_tolerance = 1e-6
+        if (
+            not _finite_vector(mass, size=1)
+            or not -probability_tolerance
+            <= float(mass)
+            <= 1.0 + probability_tolerance
+        ):
             raise ValueError(f"Invalid action-token probability mass at step {key}")
 
 

@@ -150,6 +150,18 @@ target/destination, normal 정책 성공 여부를 점검한다.
 수집 종료 시에도 같은 semantic validator가 자동 실행되며, 통과한 run에만
 `COLLECTION_COMPLETE`가 생성된다.
 
+수집 목표는 달성했지만 마지막 validation에서만 중단된 run은
+rollout을 다시 실행하지 말고 다음처럼 복구한다.
+
+```bash
+python scripts/openvla/validate_paired_release_dataset.py \
+  --run-dir "$RUN_DIR" \
+  --finalize-incomplete
+```
+
+raw record·task별 quota·semantic validation이 모두 통과한 경우에만
+manifest와 `COLLECTION_COMPLETE`를 완료 처리한다.
+
 ## 3. 전체 수집과 업로드
 
 10개 task를 5개 Pod에 나누되 **각 task를 별도 run으로 순차 실행**한다.

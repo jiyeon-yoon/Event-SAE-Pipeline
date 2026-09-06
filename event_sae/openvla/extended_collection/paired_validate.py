@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -724,3 +725,67 @@ def validate_paired_release_run(
         "per_task": per_task,
         "prefix_metrics": prefix_metrics,
     }
+
+
+def finalize_paired_release_run(
+    run_dir: str | Path,
+    *,
+    min_valid_pairs_per_task: int | None = None,
+    min_primary_pairs_per_task: int | None = None,
+) -> dict[str, Any]:
+    """Finalize an intact run interrupted only by post-collection validation."""
+
+    root = Path(run_dir).expanduser().resolve()
+    manifest_path = root / "manifest.json"
+    marker_path = root / "COLLECTION_COMPLETE"
+    original_manifest = _json(manifest_path)
+    status = original_manifest.get("collection_status")
+    if status == "complete":
+        return validate_paired_release_run(
+            root,
+            min_valid_pairs_per_task=min_valid_pairs_per_task,
+            min_primary_pairs_per_task=min_primary_pairs_per_task,
+        )
+    if status != "in_progress":
+        raise ValueError(
+            f"Only an in-progress run can be finalized; found {status!r}"
+        )
+    if marker_path.exists():
+        raise ValueError("Incomplete manifest unexpectedly has COLLECTION_COMPLETE")
+
+    # Validate all raw files and quotas before changing completion metadata.
+    validate_paired_release_run(
+        root,
+        min_valid_pairs_per_task=min_valid_pairs_per_task,
+        min_primary_pairs_per_task=min_primary_pairs_per_task,
+        require_complete=False,
+    )
+    aggregate = _json(root / "summary.json")
+    completed_manifest = dict(original_manifest)
+    completed_manifest.update(
+        {
+            "collection_status": "complete",
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "summary": aggregate,
+        }
+    )
+
+    def write_manifest(value: dict[str, Any]) -> None:
+        temporary = root / "manifest.json.tmp"
+        temporary.write_text(
+            json.dumps(value, indent=2) + "\n", encoding="utf-8"
+        )
+        temporary.replace(manifest_path)
+
+    write_manifest(completed_manifest)
+    marker_path.write_text("paired release collection complete\n", encoding="utf-8")
+    try:
+        return validate_paired_release_run(
+            root,
+            min_valid_pairs_per_task=min_valid_pairs_per_task,
+            min_primary_pairs_per_task=min_primary_pairs_per_task,
+        )
+    except Exception:
+        marker_path.unlink(missing_ok=True)
+        write_manifest(original_manifest)
+        raise
