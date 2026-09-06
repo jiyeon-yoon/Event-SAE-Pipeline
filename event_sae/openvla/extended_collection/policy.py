@@ -98,6 +98,22 @@ def _clamp_probability(value: float) -> float:
     return min(1.0, max(0.0, float(value)))
 
 
+def _openvla_action_vocab_size(model) -> int:
+    """Return OpenVLA's token count, not its smaller decoder-center count."""
+
+    center_count = int(np.asarray(model.bin_centers).shape[0])
+    action_vocab_size = center_count + 1
+    configured = getattr(getattr(model, "config", None), "n_action_bins", None)
+    if configured is None:
+        raise RuntimeError("OpenVLA config.n_action_bins is missing")
+    if int(configured) != action_vocab_size:
+        raise RuntimeError(
+            "OpenVLA action-bin metadata is inconsistent: "
+            f"config.n_action_bins={configured}, bin_centers={center_count}"
+        )
+    return action_vocab_size
+
+
 def _summarize_action_scores(
     scores,
     token_ids: list[int],
@@ -286,11 +302,15 @@ def infer_action_with_uncertainty(
     if action.shape != (7,):
         raise RuntimeError(f"Decoded action has unexpected shape {action.shape}")
 
+    # OpenVLA builds N bin edges and N-1 bin centers, but digitization emits
+    # indices 1..N. Therefore N token IDs (not len(bin_centers)) belong to
+    # the action vocabulary; the two upper-edge IDs decode to the final center.
+    action_vocab_size = _openvla_action_vocab_size(model)
     uncertainty = _summarize_action_scores(
         generated.scores,
         token_ids,
         action_vocab_end=int(model.vocab_size),
-        action_vocab_size=int(np.asarray(model.bin_centers).shape[0]),
+        action_vocab_size=action_vocab_size,
     )
     preprocessing["prompt_template"] = (
         "openvla-v01" if "openvla-v01" in cfg.model.checkpoint else "openvla"

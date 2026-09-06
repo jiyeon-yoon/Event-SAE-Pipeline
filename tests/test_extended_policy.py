@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,7 @@ class FakeProcessor:
 class FakeModel:
     vocab_size = 100
     bin_centers = np.linspace(-0.75, 0.75, 4)
+    config = SimpleNamespace(n_action_bins=5)
 
     def parameters(self):
         yield torch.zeros(1)
@@ -51,7 +53,7 @@ class FakeModel:
     def generate(self, input_ids, **kwargs):
         assert int(input_ids[0, -1]) == 29871
         assert kwargs["max_new_tokens"] == 7
-        ids = torch.tensor([[99, 98, 97, 96, 99, 98, 97]], dtype=torch.long)
+        ids = torch.tensor([[99, 98, 97, 96, 95, 98, 97]], dtype=torch.long)
         sequences = torch.cat((input_ids, ids), dim=1)
         scores = []
         for token in ids[0]:
@@ -74,8 +76,14 @@ def test_single_generation_decodes_action_and_drops_logits():
         "libero_spatial",
     )
     assert output.raw_action.shape == (7,)
-    assert output.action_token_ids == [99, 98, 97, 96, 99, 98, 97]
+    assert output.action_token_ids == [99, 98, 97, 96, 95, 98, 97]
     assert len(output.uncertainty["per_action_dimension"]) == 7
+    assert output.uncertainty["action_vocab_start"] == 95
+    assert output.uncertainty["action_vocab_size"] == 5
+    assert all(
+        row["selected_token_is_action_token"]
+        for row in output.uncertainty["per_action_dimension"]
+    )
     assert "logits" not in repr(output.uncertainty).lower()
     assert output.model_input_rgb.shape == (224, 224, 3)
 
@@ -91,6 +99,34 @@ def test_uncertainty_is_over_action_vocabulary_only():
     assert row["selected_token_conditional_rank"] == 1
     assert row["conditional_action_token"]["probability_mass_in_full_vocabulary"] < 1e-6
     assert result["action_vocab_start"] == 3
+
+
+def test_lower_boundary_action_token_is_included():
+    scores = (torch.zeros((1, 100)),)
+    result = _summarize_action_scores(
+        scores, [95], action_vocab_end=100, action_vocab_size=5
+    )
+    row = result["per_action_dimension"][0]
+    assert result["action_vocab_start"] == 95
+    assert row["selected_token_is_action_token"] is True
+    assert row["selected_token_conditional_probability"] is not None
+
+
+def test_inconsistent_openvla_bin_metadata_is_rejected():
+    model = FakeModel()
+    model.config = SimpleNamespace(n_action_bins=4)
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(center_crop=False, checkpoint="openvla/test")
+    )
+    with pytest.raises(RuntimeError, match="action-bin metadata is inconsistent"):
+        infer_action_with_uncertainty(
+            model,
+            FakeProcessor(),
+            cfg,
+            np.zeros((224, 224, 3), dtype=np.uint8),
+            "move object",
+            "libero_spatial",
+        )
 
 
 def test_probability_mass_roundoff_is_clamped():

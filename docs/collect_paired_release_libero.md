@@ -33,7 +33,7 @@ release는 primary 필수 조건이 아니며, `t_cmd`·`t_detach`·`t_obs`의 �
 | reward·done·success·info, BDDL goal predicate의 step 전/후 만족 여부 | 성공 여부와 목표 진행 상태를 simulator 기준으로 판정 |
 | qpos·qvel·act·ctrl·force·sensor 등 지정된 simulator vector의 step 전/후 값 | 두 조건의 intervention 이전 동역학이 같은지 검증하고 후처리 분석 |
 | raw OpenVLA action, LIBERO 변환 action, 실제 실행 action, gripper override | 강제-release에서 gripper만 바뀌었는지 확인하고 행동 변화 추적 |
-| token ID와 entropy·top-1 probability·margin 등 요약값 | full logits를 저장하지 않고도 정책 불확실성 분석 |
+| token ID와 entropy·top-1 probability·margin 등 요약값 | OpenVLA의 256개 action token 전체에서 full logits 없이 정책 불확실성 분석 |
 | model-input RGB와 rollout MP4 | 물리 이벤트를 실제 장면 및 시간축과 함께 확인 |
 | Layer 31 dense hidden과 episode/condition/step/forward→shard index | raw-hidden probe, SAE Top-K, event 주변 feature와 시간 지표를 재수집 없이 계산 |
 
@@ -161,6 +161,9 @@ python scripts/openvla/validate_paired_release_dataset.py \
 
 raw record·task별 quota·semantic validation이 모두 통과한 경우에만
 manifest와 `COLLECTION_COMPLETE`를 완료 처리한다.
+`--finalize-incomplete`는 저장된 값을 수정하지 않는다. 이전 v4의
+255-token uncertainty는 복구할 수 없으므로, v5로 1-pair smoke를 다시
+통과한 후에만 본 수집을 시작한다.
 
 ## 3. 전체 수집과 업로드
 
@@ -242,7 +245,7 @@ done
 - `summary.json`: task별 시도·valid·primary 수와 목표 달성 여부
 - `trajectory_records.jsonl`: object·robot·contact·grasp·reward·predicate
 - `action_records.jsonl`: raw, policy, 실제 action과 gripper override
-- `policy_uncertainty.jsonl`: entropy, top probability, margin
+- `policy_uncertainty.jsonl`: 256개 action-token 기준 entropy, top probability, margin
 - `initial_states/`, `sim_state/`, `vision/`, `videos/`
 - `sae_activations/post_mlp_residual/`: Layer 31 dense activation과 step index
 - `COLLECTION_COMPLETE`: 정상 완료된 run에만 생성

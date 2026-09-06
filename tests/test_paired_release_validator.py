@@ -58,9 +58,11 @@ def _uncertainty():
         dimensions.append(
             {
                 "action_dimension": index,
+                "selected_token_id": 31999,
                 "selected_token_is_action_token": True,
                 "selected_token_probability": 0.8,
                 "selected_token_conditional_probability": 0.9,
+                "selected_token_conditional_rank": 1,
                 "full_next_token": {
                     "entropy_nats": 1.0,
                     "normalized_entropy": 0.1,
@@ -77,8 +79,13 @@ def _uncertainty():
             }
         )
     return {
-        "action_token_ids": [32000] * 7,
-        "uncertainty": {"per_action_dimension": dimensions},
+        "action_token_ids": [31999] * 7,
+        "uncertainty": {
+            "action_vocab_start": 31744,
+            "action_vocab_end_exclusive": 32000,
+            "action_vocab_size": 256,
+            "per_action_dimension": dimensions,
+        },
     }
 
 
@@ -91,10 +98,13 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
     }
     policy_action = np.asarray([0.1, 0, 0, 0, 0, 0, 1.0])
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v4",
+        "schema_version": "extended_openvla_libero_paired_release_v5",
         "collection_status": "complete",
         "activation_stream": {"layer": 31, "forwards_per_policy_step": 7},
-        "policy_uncertainty": {"full_logits_stored": False},
+        "policy_uncertainty": {
+            "full_logits_stored": False,
+            "action_vocab_size": 256,
+        },
         "resolved_task_ids": [0],
         "config": {
             "env": {"num_trials_per_task": 1},

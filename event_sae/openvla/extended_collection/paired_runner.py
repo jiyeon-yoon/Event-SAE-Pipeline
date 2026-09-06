@@ -35,7 +35,10 @@ from event_sae.openvla.extended_collection.controlled_release import (
     target_grasped,
     target_z,
 )
-from event_sae.openvla.extended_collection.policy import infer_action_with_uncertainty
+from event_sae.openvla.extended_collection.policy import (
+    _openvla_action_vocab_size,
+    infer_action_with_uncertainty,
+)
 from event_sae.openvla.extended_collection.runner import (
     _MAX_STEPS_PER_SUITE,
     _git_state,
@@ -832,6 +835,7 @@ def collect_paired_release_libero(
     model = load_openvla(cfg)
     processor = load_processor(cfg)
     unnorm_key = _resolve_unnorm_key(model, cfg.env.task_suite_name)
+    action_vocab_size = _openvla_action_vocab_size(model)
     if cfg.env.task_suite_name not in _MAX_STEPS_PER_SUITE:
         raise ValueError(f"Unsupported task suite: {cfg.env.task_suite_name}")
     max_steps = _MAX_STEPS_PER_SUITE[cfg.env.task_suite_name]
@@ -842,7 +846,7 @@ def collect_paired_release_libero(
         f"{cfg.env.task_suite_name}-paired-release",
     )
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v4",
+        "schema_version": "extended_openvla_libero_paired_release_v5",
         "collection_status": "in_progress",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "code": _git_state(repo_root),
@@ -878,6 +882,8 @@ def collect_paired_release_libero(
             "episode_boundary_flush": True,
         },
         "policy_uncertainty": {
+            "action_vocab_size": action_vocab_size,
+            "action_vocab_definition": "config.n_action_bins (token ids)",
             "stored": [
                 "full_next_token_entropy/top1_probability/top1_top2_margin",
                 "action_token_probability_mass",

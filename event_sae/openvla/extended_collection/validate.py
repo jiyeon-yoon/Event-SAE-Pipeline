@@ -128,21 +128,58 @@ def _validate_rich_state(
         raise ValueError(f"Invalid {phase} goal predicates at policy step {key}")
 
 
-def _validate_uncertainty(row: dict[str, Any], key: tuple[int, int]) -> None:
+def _validate_uncertainty(
+    row: dict[str, Any],
+    key: tuple[int, int],
+    *,
+    expected_action_vocab_size: int | None = None,
+) -> None:
     if any("logit" in name.lower() for name in _walk_keys(row)):
         raise ValueError(
             "Full/raw logits-like field found in policy uncertainty output"
         )
-    if len(row.get("action_token_ids", [])) != 7:
+    action_token_ids = row.get("action_token_ids", [])
+    if len(action_token_ids) != 7:
         raise ValueError(f"Expected seven action token ids at policy step {key}")
-    dimensions = row.get("uncertainty", {}).get("per_action_dimension", [])
+    uncertainty = row.get("uncertainty", {})
+    action_vocab_start = uncertainty.get("action_vocab_start")
+    action_vocab_end = uncertainty.get("action_vocab_end_exclusive")
+    action_vocab_size = uncertainty.get("action_vocab_size")
+    if not all(
+        isinstance(value, int)
+        for value in (action_vocab_start, action_vocab_end, action_vocab_size)
+    ):
+        raise ValueError(f"Missing action-vocabulary metadata at policy step {key}")
+    if (
+        action_vocab_size <= 1
+        or action_vocab_end - action_vocab_start != action_vocab_size
+    ):
+        raise ValueError(f"Invalid action-vocabulary range at policy step {key}")
+    if (
+        expected_action_vocab_size is not None
+        and action_vocab_size != expected_action_vocab_size
+    ):
+        raise ValueError(
+            f"Expected {expected_action_vocab_size} action tokens at policy step "
+            f"{key}, got {action_vocab_size}"
+        )
+    dimensions = uncertainty.get("per_action_dimension", [])
     if len(dimensions) != 7 or [x.get("action_dimension") for x in dimensions] != list(
         range(7)
     ):
         raise ValueError(f"Expected seven ordered uncertainty dimensions at step {key}")
-    for dimension in dimensions:
+    for index, dimension in enumerate(dimensions):
+        selected_id = dimension.get("selected_token_id")
+        if selected_id != action_token_ids[index]:
+            raise ValueError(f"Selected action-token id mismatch at policy step {key}")
+        in_action_vocab = action_vocab_start <= selected_id < action_vocab_end
+        if bool(dimension.get("selected_token_is_action_token")) != in_action_vocab:
+            raise ValueError(f"Inconsistent action-token flag at policy step {key}")
         if not dimension.get("selected_token_is_action_token"):
             raise ValueError(f"Generated a non-action token at policy step {key}")
+        rank = dimension.get("selected_token_conditional_rank")
+        if not isinstance(rank, int) or not 1 <= rank <= action_vocab_size:
+            raise ValueError(f"Invalid selected action-token rank at policy step {key}")
         for name in (
             "selected_token_probability",
             "selected_token_conditional_probability",
@@ -182,7 +219,7 @@ def _validate_uncertainty(row: dict[str, Any], key: tuple[int, int]) -> None:
 def validate_extended_run(
     run_dir: str | Path,
     *,
-    expected_schema_version: str = "extended_openvla_libero_v1",
+    expected_schema_version: str = "extended_openvla_libero_v2",
     expected_episode_count: int | None = None,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir).expanduser().resolve()
@@ -263,7 +300,13 @@ def validate_extended_run(
             raise ValueError(
                 f"Uncertainty/trajectory policy-step order mismatch at row {uncertainty_count}"
             )
-        _validate_uncertainty(row, trajectory_order[index])
+        _validate_uncertainty(
+            row,
+            trajectory_order[index],
+            expected_action_vocab_size=int(
+                manifest["policy_uncertainty"]["action_vocab_size"]
+            ),
+        )
     if not (len(trajectory_order) == action_count == uncertainty_count):
         raise ValueError(
             "Step count mismatch: "

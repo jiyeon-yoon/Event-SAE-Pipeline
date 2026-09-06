@@ -54,9 +54,11 @@ def uncertainty():
         dimensions.append(
             {
                 "action_dimension": index,
+                "selected_token_id": 31999,
                 "selected_token_is_action_token": True,
                 "selected_token_probability": 0.8,
                 "selected_token_conditional_probability": 0.9,
+                "selected_token_conditional_rank": 1,
                 "full_next_token": {
                     "entropy_nats": 1.0,
                     "normalized_entropy": 0.1,
@@ -73,8 +75,13 @@ def uncertainty():
             }
         )
     return {
-        "action_token_ids": [32000] * 7,
-        "uncertainty": {"per_action_dimension": dimensions},
+        "action_token_ids": [31999] * 7,
+        "uncertainty": {
+            "action_vocab_start": 31744,
+            "action_vocab_end_exclusive": 32000,
+            "action_vocab_size": 256,
+            "per_action_dimension": dimensions,
+        },
     }
 
 
@@ -96,14 +103,43 @@ def test_uncertainty_validator_rejects_material_probability_error(mass: float):
         _validate_uncertainty(row, (1, 0))
 
 
+def test_uncertainty_validator_accepts_openvla_lower_boundary_token():
+    row = uncertainty()
+    row["action_token_ids"][0] = 31744
+    dimension = row["uncertainty"]["per_action_dimension"][0]
+    dimension["selected_token_id"] = 31744
+    _validate_uncertainty(row, (1, 0), expected_action_vocab_size=256)
+
+
+def test_uncertainty_validator_rejects_token_below_corrected_range():
+    row = uncertainty()
+    row["action_token_ids"][0] = 31743
+    dimension = row["uncertainty"]["per_action_dimension"][0]
+    dimension["selected_token_id"] = 31743
+    dimension["selected_token_is_action_token"] = False
+    with pytest.raises(ValueError, match="Generated a non-action token"):
+        _validate_uncertainty(row, (1, 0), expected_action_vocab_size=256)
+
+
+def test_uncertainty_validator_rejects_legacy_255_token_summary():
+    row = uncertainty()
+    row["uncertainty"]["action_vocab_start"] = 31745
+    row["uncertainty"]["action_vocab_size"] = 255
+    with pytest.raises(ValueError, match="Expected 256 action tokens"):
+        _validate_uncertainty(row, (1, 0), expected_action_vocab_size=256)
+
+
 def test_validator_connects_episode_step_rgb_sim_and_activation(tmp_path: Path):
     run_dir = tmp_path / "run"
     with ExtendedRunWriter(run_dir) as writer:
         writer.write_manifest(
             {
-                "schema_version": "extended_openvla_libero_v1",
+                "schema_version": "extended_openvla_libero_v2",
                 "activation_stream": {"layer": 31, "forwards_per_policy_step": 7},
-                "policy_uncertainty": {"full_logits_stored": False},
+                "policy_uncertainty": {
+                    "full_logits_stored": False,
+                    "action_vocab_size": 256,
+                },
                 "resolved_task_ids": [0],
                 "config": {
                     "env": {"num_trials_per_task": 1},
@@ -173,7 +209,7 @@ def test_validator_connects_episode_step_rgb_sim_and_activation(tmp_path: Path):
 
     summary = validate_extended_run(run_dir)
     assert summary == {
-        "schema_version": "extended_openvla_libero_v1",
+        "schema_version": "extended_openvla_libero_v2",
         "episodes": 1,
         "policy_steps": 1,
         "activation_index_records": 7,

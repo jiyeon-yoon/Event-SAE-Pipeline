@@ -20,7 +20,7 @@ from event_sae.openvla.extended_collection.controlled_release import (
 from event_sae.openvla.extended_collection.validate import validate_extended_run
 
 
-PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v4"
+PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v5"
 
 
 def _json(path: Path) -> dict[str, Any]:

@@ -19,7 +19,7 @@ hook·파일 writer는 `extended_collection/`에 별도로 구현되어 있다.
 - reward, success, BDDL goal predicate별 상태와 충족 비율
 - 7D raw OpenVLA action과 LIBERO에 실제 전달한 action
 - 7개 action 차원 각각의 전체 vocabulary entropy·top probability·margin
-- action-token probability mass와 action token 내부의 조건부 entropy·probability·margin
+- OpenVLA 256개 action-token probability mass와 조건부 entropy·probability·margin
 
 전체 logits, depth, segmentation, 다른 layer activation은 저장하지 않는다.
 BDDL predicate는 각각 저장하지만, 순서가 정의된 semantic subgoal로 재해석하지 않는다.

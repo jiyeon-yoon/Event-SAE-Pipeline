@@ -21,7 +21,10 @@ from event_sae.openvla.extended_collection.activation import (
     Layer31ActivationCollector,
 )
 from event_sae.openvla.extended_collection.config import ExtendedRunConfig
-from event_sae.openvla.extended_collection.policy import infer_action_with_uncertainty
+from event_sae.openvla.extended_collection.policy import (
+    _openvla_action_vocab_size,
+    infer_action_with_uncertainty,
+)
 from event_sae.openvla.extended_collection.runtime import (
     dummy_action,
     get_source_rgb,
@@ -151,6 +154,7 @@ def collect_extended_libero(cfg: ExtendedRunConfig) -> dict[str, Any]:
     model = load_openvla(cfg)
     processor = load_processor(cfg)
     unnorm_key = _resolve_unnorm_key(model, cfg.env.task_suite_name)
+    action_vocab_size = _openvla_action_vocab_size(model)
 
     benchmark_cls = benchmark.get_benchmark_dict()[cfg.env.task_suite_name]
     suite = benchmark_cls()
@@ -162,7 +166,7 @@ def collect_extended_libero(cfg: ExtendedRunConfig) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[3]
     run_dir = _new_run_dir(cfg.output.root_dir, cfg.env.task_suite_name)
     manifest = {
-        "schema_version": "extended_openvla_libero_v1",
+        "schema_version": "extended_openvla_libero_v2",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "code": _git_state(repo_root),
         "config": cfg.to_dict(),
@@ -175,6 +179,8 @@ def collect_extended_libero(cfg: ExtendedRunConfig) -> dict[str, Any]:
             "forwards_per_policy_step": 7,
         },
         "policy_uncertainty": {
+            "action_vocab_size": action_vocab_size,
+            "action_vocab_definition": "config.n_action_bins (token ids)",
             "stored": [
                 "full_next_token_entropy/top1_probability/top1_top2_margin",
                 "action_token_probability_mass",

@@ -74,7 +74,7 @@ def main() -> None:
     }
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     schema = manifest.get("schema_version")
-    if schema == "extended_openvla_libero_paired_release_v4":
+    if schema == "extended_openvla_libero_paired_release_v5":
         if manifest.get("collection_status") != "complete":
             raise RuntimeError("Paired collection is not marked complete")
         from event_sae.openvla.extended_collection.paired_validate import (
@@ -83,7 +83,7 @@ def main() -> None:
 
         validate_paired_release_run(root)
         required.update({"pair_results.jsonl", "COLLECTION_COMPLETE"})
-    elif schema != "extended_openvla_libero_v1":
+    elif schema != "extended_openvla_libero_v2":
         raise RuntimeError(f"Unsupported extended dataset schema: {schema!r}")
     absent_required = sorted(required - set(local))
     if absent_required:
