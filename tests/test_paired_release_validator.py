@@ -13,7 +13,10 @@ from event_sae.openvla.extended_collection.paired_validate import (
     finalize_paired_release_run,
     validate_paired_release_run,
 )
-from event_sae.openvla.extended_collection.writer import ExtendedRunWriter
+from event_sae.openvla.extended_collection.writer import (
+    ExtendedRunWriter,
+    array_sha256,
+)
 
 
 PAIR_ID = "libero_spatial-task00-trial000-seed0"
@@ -94,11 +97,21 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
     initial = np.asarray([1.0, 2.0], dtype=np.float32)
     vectors = {
         name: np.asarray([0.0], dtype=np.float32)
-        for name in ("qpos", "qvel", "qacc", "ctrl")
+        for name in (
+            "qpos",
+            "qvel",
+            "qacc",
+            "qacc_warmstart",
+            "ctrl",
+            "qfrc_applied",
+            "xfrc_applied",
+        )
     }
+    vectors["mujoco_integration_state"] = np.arange(8, dtype=np.float64)
+    integration_hash = array_sha256(vectors["mujoco_integration_state"])
     policy_action = np.asarray([0.1, 0, 0, 0, 0, 0, 1.0])
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v6",
+        "schema_version": "extended_openvla_libero_paired_release_v7",
         "collection_status": "complete",
         "activation_stream": {"layer": 31, "forwards_per_policy_step": 7},
         "policy_uncertainty": {
@@ -170,6 +183,7 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                         **common_identity,
                         "step_in_episode": step,
                         "policy_input_source": policy_input_source,
+                        "sim_state_integration_sha256": integration_hash,
                     },
                     pre_json=pre,
                     post_json=post,
@@ -211,6 +225,17 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                 "invalid_reason": None,
                 "warm_start_sim_state_sha256": f"{condition}-sim",
                 "warm_start_source_rgb_sha256": f"{condition}-rgb",
+                "warm_start_integration_state_sha256": "shared-integration",
+                "warm_start_model_xml_sha256": "shared-model-xml",
+                "warm_start_robosuite_python_state_sha256": "shared-python",
+                "warm_start_restore_pre_forward_max_abs_delta": 0.0,
+                "warm_start_restore_post_forward_max_abs_delta": 0.0,
+                "warm_start_restore_post_python_state_max_abs_delta": 0.0,
+                "warm_start_source": (
+                    "seeded_hard_reset_warmup_checkpoint"
+                    if condition == "normal"
+                    else ("seeded_hard_reset_then_normal_mjstate_and_python_replay")
+                ),
             }
             episode_results[condition] = writer.finish_episode(
                 result=result,
@@ -230,6 +255,9 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                     "initial_state_exact": True,
                     "warm_start_sim_state_exact": False,
                     "warm_start_source_rgb_exact": False,
+                    "warm_start_integration_state_exact": True,
+                    "warm_start_model_xml_exact": True,
+                    "warm_start_robosuite_python_state_exact": True,
                 },
                 "task_id": 0,
                 "task_episode_idx": 0,
@@ -248,7 +276,13 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                 "primary_analysis_eligible": primary,
                 "normal": episode_results["normal"],
                 "forced_release": episode_results["forced_release"],
-                "prefix_comparison": {"rgb_exact": True},
+                "prefix_comparison": {
+                    "steps_compared": 2,
+                    "rgb_exact": True,
+                    "integration_state_exact": True,
+                    "max_integration_state_abs_delta": 0.0,
+                    "first_mismatch_step": None,
+                },
             }
         )
 
@@ -272,6 +306,7 @@ def _build_run(tmp_path: Path, *, primary: bool = True) -> Path:
                             if condition == "forced_release" and step <= 1
                             else "observed"
                         ),
+                        "sim_state_integration_sha256": integration_hash,
                         "pair_seed": 0,
                         "task_id": 0,
                         "task_episode_idx": 0,
@@ -638,4 +673,118 @@ def test_paired_validator_rejects_summary_not_backed_by_raw_records(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="summary.valid_pairs"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_v7_rejects_missing_integration_state_hash(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    path = run_dir / "action_records.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0].pop("sim_state_integration_sha256")
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integration-state hashes"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_v7_rejects_runtime_integration_state_drift(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    path = run_dir / "pair_results.jsonl"
+    pair = json.loads(path.read_text())
+    pair["prefix_comparison"]["max_integration_state_abs_delta"] = 2e-6
+    path.write_text(json.dumps(pair) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integration-state prefix exceeds"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_v7_rejects_different_model_xml(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    path = run_dir / "pair_results.jsonl"
+    pair = json.loads(path.read_text())
+    pair["forced_release"]["warm_start_model_xml_sha256"] = "different-model"
+    path.write_text(json.dumps(pair) + "\n", encoding="utf-8")
+    episode_path = run_dir / "episode_results.jsonl"
+    episodes = [json.loads(line) for line in episode_path.read_text().splitlines()]
+    episodes[1]["warm_start_model_xml_sha256"] = "different-model"
+    episode_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in episodes), encoding="utf-8"
+    )
+    summary_path = run_dir / "summary.json"
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["summary"] = json.loads(summary_path.read_text())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="model XML differs"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_v7_rejects_runtime_offline_hash_audit_disagreement(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    path = run_dir / "pair_results.jsonl"
+    pair = json.loads(path.read_text())
+    pair["prefix_comparison"]["integration_state_exact"] = False
+    path.write_text(json.dumps(pair) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integration-state prefix is not bit-exact"):
+        validate_paired_release_run(run_dir)
+
+
+def _mutate_forced_result_field(run_dir: Path, field: str, value, *, remove=False):
+    episode_path = run_dir / "episode_results.jsonl"
+    episodes = [json.loads(line) for line in episode_path.read_text().splitlines()]
+    forced = next(row for row in episodes if row["condition"] == "forced_release")
+    if remove:
+        forced.pop(field, None)
+    else:
+        forced[field] = value
+    episode_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in episodes), encoding="utf-8"
+    )
+
+    pair_path = run_dir / "pair_results.jsonl"
+    pair = json.loads(pair_path.read_text())
+    if remove:
+        pair["forced_release"].pop(field, None)
+    else:
+        pair["forced_release"][field] = value
+    pair_path.write_text(json.dumps(pair) + "\n", encoding="utf-8")
+
+
+def test_paired_v7_rejects_missing_python_state_evidence(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    _mutate_forced_result_field(
+        run_dir, "warm_start_robosuite_python_state_sha256", None, remove=True
+    )
+
+    with pytest.raises(ValueError, match="warm-start evidence is missing"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_v7_rejects_different_python_state(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    _mutate_forced_result_field(
+        run_dir, "warm_start_robosuite_python_state_sha256", "different-python"
+    )
+
+    with pytest.raises(ValueError, match="robosuite Python state differs"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_v7_rejects_post_python_state_drift(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    _mutate_forced_result_field(
+        run_dir, "warm_start_restore_post_python_state_max_abs_delta", 2e-6
+    )
+
+    with pytest.raises(ValueError, match="post-Python-state state exceeds"):
+        validate_paired_release_run(run_dir)
+
+
+def test_paired_v7_rejects_wrong_warm_start_source(tmp_path: Path):
+    run_dir = _build_run(tmp_path)
+    _mutate_forced_result_field(run_dir, "warm_start_source", "wrong-source")
+
+    with pytest.raises(ValueError, match="warm-start source is invalid"):
         validate_paired_release_run(run_dir)

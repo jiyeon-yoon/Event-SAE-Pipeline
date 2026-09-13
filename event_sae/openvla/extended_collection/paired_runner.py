@@ -8,13 +8,15 @@ initial state and seed while forcing only the gripper command open.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.metadata
 import json
 import platform
+import random
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -74,11 +76,116 @@ STATEFUL_SIM_FIELDS = (
     "qpos",
     "qvel",
     "act",
+    "history",
+    "qacc_warmstart",
     "ctrl",
+    "qfrc_applied",
+    "xfrc_applied",
+    "eq_active",
     "mocap_pos",
     "mocap_quat",
     "userdata",
+    "plugin_state",
 )
+
+MUJOCO_MODEL_DIMENSIONS = (
+    "nq",
+    "nv",
+    "na",
+    "nu",
+    "nmocap",
+    "nuserdata",
+    "neq",
+    "npluginstate",
+)
+
+CONTROLLER_REPLAY_FIELDS = (
+    "initial_joint",
+    "initial_ee_pos",
+    "initial_ee_ori_mat",
+    "goal_pos",
+    "goal_ori",
+    "relative_ori",
+    "ori_ref",
+    "kp",
+    "kd",
+    "torques",
+    "action_scale",
+    "action_input_transform",
+    "action_output_transform",
+    "new_update",
+    "interpolator_pos",
+    "interpolator_ori",
+)
+
+ROBOT_REPLAY_FIELDS = (
+    "torques",
+    "recent_qpos",
+    "recent_actions",
+    "recent_torques",
+    "recent_ee_forcetorques",
+    "recent_ee_pose",
+    "recent_ee_vel",
+    "recent_ee_vel_buffer",
+    "recent_ee_acc",
+)
+
+
+@dataclass(frozen=True)
+class ReplayObjectCheckpoint:
+    """Serializable mutable fields of a nested robosuite helper object."""
+
+    object_type: str
+    fields: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RobotControlCheckpoint:
+    """Python-side robosuite state that is not stored in ``MjData``."""
+
+    robot_type: str
+    controller_type: str
+    controller_fields: dict[str, Any]
+    robot_fields: dict[str, Any]
+    gripper_type: str | None
+    gripper_fields: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ObservableCheckpoint:
+    """Mutable state of one robosuite ``Observable``."""
+
+    observable_type: str
+    fields: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RobosuitePythonCheckpoint:
+    """Python-only control and observation state at the paired branch point."""
+
+    robots: tuple[RobotControlCheckpoint, ...]
+    observables: dict[str, ObservableCheckpoint]
+    obs_cache: dict[str, Any]
+    rng_state: dict[str, Any] | None
+    python_random_state: tuple[Any, ...]
+    numpy_random_state: tuple[Any, ...]
+    torch_cpu_rng_state: np.ndarray
+    torch_cuda_rng_states: tuple[np.ndarray, ...]
+
+
+@dataclass(frozen=True)
+class MujocoIntegrationCheckpoint:
+    """Exact MuJoCo forward-dynamics input at the paired branch point."""
+
+    state: np.ndarray
+    state_sha256: str
+    state_size: int
+    model_dimensions: tuple[int, ...]
+    model_xml_sha256: str | None
+    timestep: int | None
+    cur_time: float | None
+    done: bool | None
+    robosuite_python_state: RobosuitePythonCheckpoint | None = None
 
 
 @dataclass
@@ -93,6 +200,8 @@ class PrefixTrace:
     policy_action: np.ndarray
     qpos: np.ndarray
     qvel: np.ndarray
+    integration_state: np.ndarray
+    integration_state_sha256: str
 
 
 @dataclass
@@ -101,12 +210,14 @@ class PrefixComparison:
     rgb_exact: bool = True
     observed_rgb_exact: bool = True
     stateful_sim_exact: bool = True
+    integration_state_exact: bool = True
     max_observed_rgb_abs_delta: float = 0.0
     max_raw_action_abs_delta: float = 0.0
     max_policy_action_abs_delta: float = 0.0
     max_qpos_abs_delta: float = 0.0
     max_qvel_abs_delta: float = 0.0
     max_stateful_sim_abs_delta: float = 0.0
+    max_integration_state_abs_delta: float = 0.0
     first_mismatch_step: int | None = None
     mismatch_field: str | None = None
 
@@ -126,6 +237,9 @@ class PrefixComparison:
         qvel_delta = _max_abs_delta(normal.qvel, forced.qvel)
         observed_rgb_delta = _max_abs_delta(
             normal.observed_source_rgb, forced.observed_source_rgb
+        )
+        integration_state_delta = _max_abs_delta(
+            normal.integration_state, forced.integration_state
         )
         if set(normal.stateful_sim) != set(forced.stateful_sim):
             state_field, state_delta = "field_set", float("inf")
@@ -151,14 +265,23 @@ class PrefixComparison:
         self.max_stateful_sim_abs_delta = max(
             self.max_stateful_sim_abs_delta, state_delta
         )
+        self.max_integration_state_abs_delta = max(
+            self.max_integration_state_abs_delta, integration_state_delta
+        )
         rgb_equal = normal.model_input_rgb_sha256 == forced.model_input_rgb_sha256
         observed_rgb_equal = (
             normal.observed_source_rgb_sha256 == forced.observed_source_rgb_sha256
         )
         sim_equal = normal.stateful_sim_sha256 == forced.stateful_sim_sha256
+        integration_state_equal = (
+            normal.integration_state_sha256 == forced.integration_state_sha256
+        )
         self.rgb_exact = self.rgb_exact and rgb_equal
         self.observed_rgb_exact = self.observed_rgb_exact and observed_rgb_equal
         self.stateful_sim_exact = self.stateful_sim_exact and sim_equal
+        self.integration_state_exact = (
+            self.integration_state_exact and integration_state_equal
+        )
 
         mismatch = None
         if not rgb_equal:
@@ -173,6 +296,8 @@ class PrefixComparison:
             mismatch = "pre_qvel"
         elif state_delta > state_atol:
             mismatch = f"pre_{state_field}"
+        elif not integration_state_equal:
+            mismatch = "pre_mujoco_integration_state_not_exact"
         if mismatch is not None and self.first_mismatch_step is None:
             self.first_mismatch_step = int(step)
             self.mismatch_field = mismatch
@@ -350,15 +475,523 @@ def _pair_invalid_reasons(
             normal["warm_start_source_rgb_sha256"]
             == forced["warm_start_source_rgb_sha256"]
         ),
+        "warm_start_integration_state_exact": (
+            normal["warm_start_integration_state_sha256"]
+            == forced["warm_start_integration_state_sha256"]
+        ),
+        "warm_start_model_xml_exact": (
+            normal["warm_start_model_xml_sha256"]
+            == forced["warm_start_model_xml_sha256"]
+        ),
+        "warm_start_robosuite_python_state_exact": (
+            normal["warm_start_robosuite_python_state_sha256"]
+            == forced["warm_start_robosuite_python_state_sha256"]
+        ),
     }
     reasons = []
     if forced["invalid_reason"] is not None:
         reasons.append(str(forced["invalid_reason"]))
     if not audit["initial_state_exact"]:
         reasons.append("initial_state_hash_mismatch")
+    if not audit["warm_start_integration_state_exact"]:
+        reasons.append("warm_start_integration_state_hash_mismatch")
+    if not audit["warm_start_model_xml_exact"]:
+        reasons.append("warm_start_model_xml_hash_mismatch")
+    if not audit["warm_start_robosuite_python_state_exact"]:
+        reasons.append("warm_start_python_state_hash_mismatch")
     if forced_fatal is not None:
         reasons.append("forced_exception")
     return reasons, audit
+
+
+def _raw_env(env):
+    return getattr(env, "env", env)
+
+
+def _qualified_type(value: Any) -> str:
+    cls = type(value)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _snapshot_replay_value(value: Any) -> Any:
+    """Copy state without copying controllers, robots, sensors, or simulator refs."""
+
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return copy.deepcopy(value)
+    if isinstance(value, np.generic):
+        return value.copy()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, tuple):
+        return tuple(_snapshot_replay_value(item) for item in value)
+    if isinstance(value, list):
+        return [_snapshot_replay_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            copy.deepcopy(key): _snapshot_replay_value(item)
+            for key, item in value.items()
+        }
+    fields = getattr(value, "__dict__", None)
+    if fields is None:
+        raise TypeError(f"Unsupported replay-state value: {_qualified_type(value)}")
+    return ReplayObjectCheckpoint(
+        object_type=_qualified_type(value),
+        fields={
+            name: _snapshot_replay_value(item)
+            for name, item in fields.items()
+            if not callable(item)
+        },
+    )
+
+
+def _restore_replay_value(current: Any, checkpoint: Any) -> Any:
+    if isinstance(checkpoint, ReplayObjectCheckpoint):
+        if current is None or _qualified_type(current) != checkpoint.object_type:
+            current_type = None if current is None else _qualified_type(current)
+            raise RuntimeError(
+                "Replay helper type changed: "
+                f"expected {checkpoint.object_type}, got {current_type}"
+            )
+        for name, value in checkpoint.fields.items():
+            if not hasattr(current, name):
+                raise RuntimeError(
+                    f"Replay helper {_qualified_type(current)} lost field {name!r}"
+                )
+            restored = _restore_replay_value(getattr(current, name), value)
+            setattr(current, name, restored)
+        return current
+    if isinstance(checkpoint, np.ndarray):
+        return checkpoint.copy()
+    if isinstance(checkpoint, np.generic):
+        return checkpoint.copy()
+    if isinstance(checkpoint, tuple):
+        current_items = (
+            current if isinstance(current, tuple) else (None,) * len(checkpoint)
+        )
+        if len(current_items) != len(checkpoint):
+            raise RuntimeError("Replay tuple length changed")
+        return tuple(
+            _restore_replay_value(item, saved)
+            for item, saved in zip(current_items, checkpoint)
+        )
+    if isinstance(checkpoint, list):
+        current_items = (
+            current if isinstance(current, list) else [None] * len(checkpoint)
+        )
+        if len(current_items) != len(checkpoint):
+            raise RuntimeError("Replay list length changed")
+        return [
+            _restore_replay_value(item, saved)
+            for item, saved in zip(current_items, checkpoint)
+        ]
+    if isinstance(checkpoint, dict):
+        current_mapping = current if isinstance(current, dict) else {}
+        return {
+            copy.deepcopy(key): _restore_replay_value(current_mapping.get(key), value)
+            for key, value in checkpoint.items()
+        }
+    return copy.deepcopy(checkpoint)
+
+
+def _replay_values_equal(left: Any, right: Any) -> bool:
+    if is_dataclass(left) or is_dataclass(right):
+        return (
+            type(left) is type(right)
+            and is_dataclass(left)
+            and is_dataclass(right)
+            and all(
+                _replay_values_equal(
+                    getattr(left, field.name), getattr(right, field.name)
+                )
+                for field in dataclass_fields(left)
+            )
+        )
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        try:
+            return bool(
+                np.array_equal(np.asarray(left), np.asarray(right), equal_nan=True)
+            )
+        except TypeError:
+            return bool(np.array_equal(np.asarray(left), np.asarray(right)))
+    if isinstance(left, np.generic) or isinstance(right, np.generic):
+        return _replay_values_equal(np.asarray(left), np.asarray(right))
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and set(left) == set(right)
+            and all(_replay_values_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (tuple, list)) or isinstance(right, (tuple, list)):
+        return (
+            isinstance(left, type(right))
+            and len(left) == len(right)
+            and all(_replay_values_equal(a, b) for a, b in zip(left, right))
+        )
+    if isinstance(left, float) and isinstance(right, float):
+        if np.isnan(left) and np.isnan(right):
+            return True
+    return bool(left == right)
+
+
+def _update_replay_digest(digest, value: Any) -> None:
+    if is_dataclass(value):
+        digest.update(b"dataclass:")
+        digest.update(_qualified_type(value).encode("utf-8"))
+        for field in dataclass_fields(value):
+            digest.update(field.name.encode("utf-8"))
+            _update_replay_digest(digest, getattr(value, field.name))
+        return
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        digest.update(b"array:")
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(repr(array.shape).encode("ascii"))
+        digest.update(array.tobytes())
+        return
+    if isinstance(value, np.generic):
+        _update_replay_digest(digest, np.asarray(value))
+        return
+    if isinstance(value, dict):
+        digest.update(b"dict:")
+        for key in sorted(value, key=lambda item: repr(item)):
+            _update_replay_digest(digest, key)
+            _update_replay_digest(digest, value[key])
+        return
+    if isinstance(value, (tuple, list)):
+        digest.update(type(value).__name__.encode("ascii"))
+        for item in value:
+            _update_replay_digest(digest, item)
+        return
+    digest.update(type(value).__name__.encode("ascii"))
+    digest.update(repr(value).encode("utf-8"))
+
+
+def _robosuite_python_state_sha256(
+    checkpoint: RobosuitePythonCheckpoint,
+) -> str:
+    digest = hashlib.sha256()
+    _update_replay_digest(digest, checkpoint)
+    return digest.hexdigest()
+
+
+def _capture_named_fields(value: Any, names: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        name: _snapshot_replay_value(getattr(value, name))
+        for name in names
+        if hasattr(value, name)
+    }
+
+
+def _restore_named_fields(value: Any, fields: dict[str, Any]) -> None:
+    for name, checkpoint in fields.items():
+        if not hasattr(value, name):
+            raise RuntimeError(
+                f"Replay target {_qualified_type(value)} lost field {name!r}"
+            )
+        restored = _restore_replay_value(getattr(value, name), checkpoint)
+        setattr(value, name, restored)
+
+
+def _observable_fields(observable: Any) -> dict[str, Any]:
+    excluded = {"_sensor", "_corrupter", "_filter", "_delayer"}
+    return {
+        name: _snapshot_replay_value(value)
+        for name, value in vars(observable).items()
+        if name not in excluded and not callable(value)
+    }
+
+
+def _capture_robosuite_python_checkpoint(env) -> RobosuitePythonCheckpoint:
+    import torch
+
+    raw = _raw_env(env)
+    robots = []
+    for robot in getattr(raw, "robots", ()):
+        controller = getattr(robot, "controller", None)
+        if controller is None:
+            raise RuntimeError("Robosuite robot has no controller")
+        gripper = getattr(robot, "gripper", None)
+        gripper_fields = (
+            _capture_named_fields(gripper, ("current_action",))
+            if gripper is not None
+            else {}
+        )
+        robots.append(
+            RobotControlCheckpoint(
+                robot_type=_qualified_type(robot),
+                controller_type=_qualified_type(controller),
+                controller_fields=_capture_named_fields(
+                    controller, CONTROLLER_REPLAY_FIELDS
+                ),
+                robot_fields=_capture_named_fields(robot, ROBOT_REPLAY_FIELDS),
+                gripper_type=(None if gripper is None else _qualified_type(gripper)),
+                gripper_fields=gripper_fields,
+            )
+        )
+
+    observables = getattr(raw, "_observables", None)
+    obs_cache = getattr(raw, "_obs_cache", None)
+    if not isinstance(observables, dict) or not isinstance(obs_cache, dict):
+        raise RuntimeError(
+            "Exact paired replay requires robosuite observables and _obs_cache"
+        )
+    observable_checkpoints = {
+        name: ObservableCheckpoint(
+            observable_type=_qualified_type(observable),
+            fields=_observable_fields(observable),
+        )
+        for name, observable in observables.items()
+    }
+    rng = getattr(raw, "rng", None)
+    rng_state = None
+    if rng is not None and hasattr(rng, "bit_generator"):
+        rng_state = copy.deepcopy(rng.bit_generator.state)
+    return RobosuitePythonCheckpoint(
+        robots=tuple(robots),
+        observables=observable_checkpoints,
+        obs_cache=_snapshot_replay_value(obs_cache),
+        rng_state=rng_state,
+        python_random_state=copy.deepcopy(random.getstate()),
+        numpy_random_state=_snapshot_replay_value(np.random.get_state()),
+        torch_cpu_rng_state=torch.get_rng_state().cpu().numpy().copy(),
+        torch_cuda_rng_states=tuple(
+            state.cpu().numpy().copy()
+            for state in (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else ()
+            )
+        ),
+    )
+
+
+def _restore_robosuite_python_checkpoint(env, checkpoint: RobosuitePythonCheckpoint):
+    import torch
+
+    raw = _raw_env(env)
+    robots = tuple(getattr(raw, "robots", ()))
+    if len(robots) != len(checkpoint.robots):
+        raise RuntimeError(
+            "Robosuite robot count changed between paired branches: "
+            f"expected {len(checkpoint.robots)}, got {len(robots)}"
+        )
+    for index, (robot, saved) in enumerate(zip(robots, checkpoint.robots)):
+        if _qualified_type(robot) != saved.robot_type:
+            raise RuntimeError(f"Robosuite robot {index} type changed")
+        controller = getattr(robot, "controller", None)
+        if controller is None or _qualified_type(controller) != saved.controller_type:
+            raise RuntimeError(f"Robosuite robot {index} controller type changed")
+        update = getattr(controller, "update", None)
+        if callable(update):
+            update(force=True)
+        _restore_named_fields(controller, saved.controller_fields)
+        _restore_named_fields(robot, saved.robot_fields)
+        gripper = getattr(robot, "gripper", None)
+        current_gripper_type = None if gripper is None else _qualified_type(gripper)
+        if current_gripper_type != saved.gripper_type:
+            raise RuntimeError(f"Robosuite robot {index} gripper type changed")
+        if gripper is not None:
+            _restore_named_fields(gripper, saved.gripper_fields)
+
+    observables = getattr(raw, "_observables", None)
+    if not isinstance(observables, dict) or set(observables) != set(
+        checkpoint.observables
+    ):
+        raise RuntimeError("Robosuite observable topology changed between branches")
+    for name, saved in checkpoint.observables.items():
+        observable = observables[name]
+        if _qualified_type(observable) != saved.observable_type:
+            raise RuntimeError(f"Robosuite observable {name!r} type changed")
+        _restore_named_fields(observable, saved.fields)
+    raw._obs_cache = _restore_replay_value(
+        getattr(raw, "_obs_cache", {}), checkpoint.obs_cache
+    )
+    if checkpoint.rng_state is not None:
+        rng = getattr(raw, "rng", None)
+        if rng is None or not hasattr(rng, "bit_generator"):
+            raise RuntimeError("Robosuite RNG topology changed between branches")
+        rng.bit_generator.state = copy.deepcopy(checkpoint.rng_state)
+
+    random.setstate(copy.deepcopy(checkpoint.python_random_state))
+    np.random.set_state(
+        _restore_replay_value(np.random.get_state(), checkpoint.numpy_random_state)
+    )
+    torch.set_rng_state(
+        torch.from_numpy(checkpoint.torch_cpu_rng_state.copy()).to(dtype=torch.uint8)
+    )
+    if checkpoint.torch_cuda_rng_states:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA RNG state exists but CUDA is unavailable")
+        if len(checkpoint.torch_cuda_rng_states) != torch.cuda.device_count():
+            raise RuntimeError("CUDA device count changed between paired branches")
+        torch.cuda.set_rng_state_all(
+            [
+                torch.from_numpy(state.copy()).to(dtype=torch.uint8)
+                for state in checkpoint.torch_cuda_rng_states
+            ]
+        )
+
+    restored = _capture_robosuite_python_checkpoint(env)
+    if not _replay_values_equal(checkpoint, restored):
+        raise RuntimeError("Robosuite Python state did not restore exactly")
+    get_observations = getattr(raw, "_get_observations", None)
+    if not callable(get_observations):
+        raise RuntimeError("LIBERO environment lacks _get_observations")
+    return get_observations()
+
+
+def _native_mujoco_handles(env):
+    try:
+        import mujoco
+    except ImportError as exc:  # pragma: no cover - runtime image owns MuJoCo
+        raise RuntimeError(
+            "Exact paired replay requires the native mujoco Python package"
+        ) from exc
+    raw = _raw_env(env)
+    native_model = getattr(raw.sim.model, "_model", raw.sim.model)
+    native_data = getattr(raw.sim.data, "_data", raw.sim.data)
+    return mujoco, native_model, native_data
+
+
+def _mujoco_model_xml_sha256(env) -> str:
+    """Fingerprint the compiled model without relying on Python object identity."""
+
+    model = _raw_env(env).sim.model
+    get_xml = getattr(model, "get_xml", None)
+    if not callable(get_xml):
+        raise RuntimeError("MuJoCo model lacks get_xml(); cannot verify replay layout")
+    xml = get_xml()
+    if not isinstance(xml, str) or not xml:
+        raise RuntimeError("MuJoCo model returned an empty XML fingerprint source")
+    return hashlib.sha256(xml.encode("utf-8")).hexdigest()
+
+
+def _capture_mujoco_integration_checkpoint(
+    env,
+    *,
+    include_model_fingerprint: bool = False,
+    include_robosuite_python_state: bool = False,
+) -> MujocoIntegrationCheckpoint:
+    mujoco, native_model, native_data = _native_mujoco_handles(env)
+    state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
+    state_size = int(mujoco.mj_stateSize(native_model, state_spec))
+    if state_size <= 0:
+        raise RuntimeError("MuJoCo returned an empty mjSTATE_INTEGRATION")
+    state = np.empty(state_size, dtype=np.float64)
+    mujoco.mj_getState(native_model, native_data, state, state_spec)
+    raw = _raw_env(env)
+    timestep = getattr(raw, "timestep", None)
+    cur_time = getattr(raw, "cur_time", None)
+    done = getattr(raw, "done", None)
+    return MujocoIntegrationCheckpoint(
+        state=state.copy(),
+        state_sha256=array_sha256(state),
+        state_size=state_size,
+        model_dimensions=tuple(
+            int(getattr(native_model, name, -1)) for name in MUJOCO_MODEL_DIMENSIONS
+        ),
+        model_xml_sha256=(
+            _mujoco_model_xml_sha256(env) if include_model_fingerprint else None
+        ),
+        timestep=None if timestep is None else int(timestep),
+        cur_time=None if cur_time is None else float(cur_time),
+        done=None if done is None else bool(done),
+        robosuite_python_state=(
+            _capture_robosuite_python_checkpoint(env)
+            if include_robosuite_python_state
+            else None
+        ),
+    )
+
+
+def _restore_mujoco_integration_checkpoint(
+    env,
+    checkpoint: MujocoIntegrationCheckpoint,
+    *,
+    state_atol: float,
+):
+    mujoco, native_model, native_data = _native_mujoco_handles(env)
+    if checkpoint.model_xml_sha256 is None:
+        raise RuntimeError("Warm-start checkpoint lacks a MuJoCo model fingerprint")
+    current_model_xml_sha256 = _mujoco_model_xml_sha256(env)
+    if current_model_xml_sha256 != checkpoint.model_xml_sha256:
+        raise RuntimeError(
+            "Forced replay rebuilt a different MuJoCo model XML; exact pairing is "
+            "impossible"
+        )
+    dimensions = tuple(
+        int(getattr(native_model, name, -1)) for name in MUJOCO_MODEL_DIMENSIONS
+    )
+    state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
+    state_size = int(mujoco.mj_stateSize(native_model, state_spec))
+    if dimensions != checkpoint.model_dimensions or state_size != checkpoint.state_size:
+        raise RuntimeError(
+            "MuJoCo model/state dimensions changed between paired branches"
+        )
+    mujoco.mj_setState(native_model, native_data, checkpoint.state, state_spec)
+    pre_forward = _capture_mujoco_integration_checkpoint(env)
+    pre_forward_delta = _max_abs_delta(checkpoint.state, pre_forward.state)
+    if pre_forward.state_sha256 != checkpoint.state_sha256:
+        raise RuntimeError(
+            "MuJoCo mj_setState did not exactly restore mjSTATE_INTEGRATION: "
+            f"max_abs_delta={pre_forward_delta}"
+        )
+    mujoco.mj_forward(native_model, native_data)
+    post_forward = _capture_mujoco_integration_checkpoint(env)
+    post_forward_delta = _max_abs_delta(checkpoint.state, post_forward.state)
+    if post_forward_delta > state_atol:
+        raise RuntimeError(
+            "MuJoCo integration state changed too much during mj_forward: "
+            f"max_abs_delta={post_forward_delta} > state_atol={state_atol}"
+        )
+
+    raw = _raw_env(env)
+    for name, value in (
+        ("timestep", checkpoint.timestep),
+        ("cur_time", checkpoint.cur_time),
+        ("done", checkpoint.done),
+    ):
+        if value is not None and hasattr(raw, name):
+            setattr(raw, name, value)
+    if checkpoint.robosuite_python_state is None:
+        raise RuntimeError("Warm-start checkpoint lacks robosuite Python control state")
+    # mjSTATE_INTEGRATION does not include OSC goals, Panda gripper's
+    # accumulated current_action, robot recent buffers, or Observable clocks.
+    # Restoring these is required before the first paired policy step.
+    obs = _restore_robosuite_python_checkpoint(env, checkpoint.robosuite_python_state)
+    post_python = _capture_mujoco_integration_checkpoint(env)
+    post_python_state_delta = _max_abs_delta(checkpoint.state, post_python.state)
+    if post_python_state_delta > state_atol:
+        raise RuntimeError(
+            "MuJoCo integration state changed too much during Python-state restore: "
+            f"max_abs_delta={post_python_state_delta} > state_atol={state_atol}"
+        )
+
+    # Controller.update(force=True) needs a forward pass to rebuild Jacobians and
+    # mass matrices, but that pass may perturb qacc_warmstart. Reapply the exact
+    # integration checkpoint without another forward so the next env.step starts
+    # from precisely the same forward-dynamics input as the normal branch.
+    mujoco.mj_setState(native_model, native_data, checkpoint.state, state_spec)
+    restored = _capture_mujoco_integration_checkpoint(
+        env,
+        include_model_fingerprint=True,
+        include_robosuite_python_state=True,
+    )
+    if restored.state_sha256 != checkpoint.state_sha256:
+        raise RuntimeError(
+            "Final MuJoCo integration-state restore was not exact: "
+            f"max_abs_delta={_max_abs_delta(checkpoint.state, restored.state)}"
+        )
+    if not _replay_values_equal(
+        checkpoint.robosuite_python_state, restored.robosuite_python_state
+    ):
+        raise RuntimeError("Final robosuite Python state restore was not exact")
+    return (
+        obs,
+        restored,
+        pre_forward_delta,
+        post_forward_delta,
+        post_python_state_delta,
+    )
 
 
 def _reset_to_initial_state(
@@ -367,6 +1000,11 @@ def _reset_to_initial_state(
     pair_seed: int,
     wait: int,
 ):
+    raw = _raw_env(env)
+    if getattr(raw, "hard_reset", None) is not True:
+        raise RuntimeError(
+            "Exact paired replay requires LIBERO / robosuite hard_reset=True"
+        )
     set_seed(pair_seed)
     env.seed(pair_seed)
     env.reset()
@@ -382,6 +1020,7 @@ def _trace(
     raw_action: np.ndarray,
     policy_action: np.ndarray,
     pre_vectors: dict[str, np.ndarray],
+    integration_checkpoint: MujocoIntegrationCheckpoint,
 ) -> PrefixTrace:
     return PrefixTrace(
         model_input_rgb=np.asarray(model_input_rgb, dtype=np.uint8).copy(),
@@ -398,6 +1037,8 @@ def _trace(
         policy_action=np.asarray(policy_action).copy(),
         qpos=np.asarray(pre_vectors["qpos"]).copy(),
         qvel=np.asarray(pre_vectors["qvel"]).copy(),
+        integration_state=integration_checkpoint.state.copy(),
+        integration_state_sha256=integration_checkpoint.state_sha256,
     )
 
 
@@ -456,20 +1097,62 @@ def _run_episode(
     max_steps: int,
     scheduled_trigger_step: int | None = None,
     normal_trace: dict[int, PrefixTrace] | None = None,
+    normal_warm_start_checkpoint: MujocoIntegrationCheckpoint | None = None,
     reference_initial_z: float | None = None,
-) -> tuple[dict[str, Any], dict[int, PrefixTrace], PrefixComparison, Exception | None]:
+) -> tuple[
+    dict[str, Any],
+    dict[int, PrefixTrace],
+    PrefixComparison,
+    Exception | None,
+    MujocoIntegrationCheckpoint,
+]:
     if condition not in (NORMAL_CONDITION, FORCED_RELEASE_CONDITION):
         raise ValueError(f"Unsupported condition: {condition}")
     if condition == FORCED_RELEASE_CONDITION and (
         scheduled_trigger_step is None
         or normal_trace is None
+        or normal_warm_start_checkpoint is None
         or reference_initial_z is None
     ):
-        raise ValueError("Forced release requires the normal trigger and trace")
+        raise ValueError(
+            "Forced release requires the normal trigger, trace, and warm-start state"
+        )
 
-    # Reset before opening writer state.  A reset failure therefore cannot leave
-    # an active half-episode in the durable output streams.
-    obs = _reset_to_initial_state(env, initial_state, pair_seed, cfg.env.num_steps_wait)
+    # Normal and forced branches use the same seeded hard-reset/controller
+    # lifecycle and identical dummy warmup. Forced replay then overlays the
+    # normal branch's complete MuJoCo forward-dynamics input before policy step 0.
+    obs = _reset_to_initial_state(
+        env,
+        initial_state,
+        pair_seed,
+        cfg.env.num_steps_wait,
+    )
+    warm_start_restore_pre_forward_max_abs_delta = 0.0
+    warm_start_restore_post_forward_max_abs_delta = 0.0
+    warm_start_restore_post_python_state_max_abs_delta = 0.0
+    if condition == FORCED_RELEASE_CONDITION:
+        (
+            obs,
+            warm_start_checkpoint,
+            warm_start_restore_pre_forward_max_abs_delta,
+            warm_start_restore_post_forward_max_abs_delta,
+            warm_start_restore_post_python_state_max_abs_delta,
+        ) = _restore_mujoco_integration_checkpoint(
+            env,
+            normal_warm_start_checkpoint,
+            state_atol=cfg.paired_release.state_atol,
+        )
+        warm_start_source = "seeded_hard_reset_then_normal_mjstate_and_python_replay"
+    else:
+        # Capture the normal branch exactly as returned by the official dummy
+        # warmup. The forced branch restores these Observable clocks/caches
+        # directly, rather than running an asymmetric extra sensor update.
+        warm_start_checkpoint = _capture_mujoco_integration_checkpoint(
+            env,
+            include_model_fingerprint=True,
+            include_robosuite_python_state=True,
+        )
+        warm_start_source = "seeded_hard_reset_warmup_checkpoint"
     prompt = writer.begin_episode(
         prompt_record={
             "episode_num": episode_num,
@@ -528,6 +1211,7 @@ def _run_episode(
                 )
             source_rgb = get_source_rgb(obs, 224)
             pre = capture_snapshot(env, obs, previous=previous_pre, dt=control_dt)
+            integration_checkpoint = _capture_mujoco_integration_checkpoint(env)
             previous_pre = pre
             if step == 0:
                 warm_start_sim_state_sha256 = _sim_state_sha256(pre.sim_vectors)
@@ -574,6 +1258,7 @@ def _run_episode(
                 "task_description": description,
                 "step_in_episode": step,
                 "policy_input_source": policy_input_source,
+                "sim_state_integration_sha256": (integration_checkpoint.state_sha256),
             }
             activation_collector.begin_step(common)
             transaction_started = True
@@ -594,6 +1279,7 @@ def _run_episode(
                 raw_action,
                 policy_action,
                 pre.sim_vectors,
+                integration_checkpoint,
             )
             trace[step] = current_trace
 
@@ -658,6 +1344,7 @@ def _run_episode(
                     forced_open_steps += 1
 
             next_obs, reward, done, info = env.step(executed_action.tolist())
+            post_integration_checkpoint = _capture_mujoco_integration_checkpoint(env)
             post = capture_snapshot(env, next_obs, previous=pre, dt=control_dt)
             confirmed = None
             if t_cmd is not None and t_detach_confirmed is None:
@@ -720,8 +1407,14 @@ def _run_episode(
                 common=common,
                 pre_json=pre.json_state,
                 post_json=post.json_state,
-                pre_vectors=pre.sim_vectors,
-                post_vectors=post.sim_vectors,
+                pre_vectors={
+                    **pre.sim_vectors,
+                    "mujoco_integration_state": integration_checkpoint.state,
+                },
+                post_vectors={
+                    **post.sim_vectors,
+                    "mujoco_integration_state": post_integration_checkpoint.state,
+                },
                 raw_action=raw_action,
                 policy_action=policy_action,
                 executed_action=executed_action,
@@ -830,6 +1523,23 @@ def _run_episode(
         "initial_state_sha256": prompt["initial_state_sha256"],
         "warm_start_sim_state_sha256": warm_start_sim_state_sha256,
         "warm_start_source_rgb_sha256": warm_start_source_rgb_sha256,
+        "warm_start_integration_state_sha256": (warm_start_checkpoint.state_sha256),
+        "warm_start_model_xml_sha256": warm_start_checkpoint.model_xml_sha256,
+        "warm_start_robosuite_python_state_sha256": (
+            _robosuite_python_state_sha256(warm_start_checkpoint.robosuite_python_state)
+            if warm_start_checkpoint.robosuite_python_state is not None
+            else None
+        ),
+        "warm_start_restore_pre_forward_max_abs_delta": (
+            warm_start_restore_pre_forward_max_abs_delta
+        ),
+        "warm_start_restore_post_forward_max_abs_delta": (
+            warm_start_restore_post_forward_max_abs_delta
+        ),
+        "warm_start_restore_post_python_state_max_abs_delta": (
+            warm_start_restore_post_python_state_max_abs_delta
+        ),
+        "warm_start_source": warm_start_source,
         "success": success,
         "success_step": success_step,
         "num_actions": step_count,
@@ -852,7 +1562,7 @@ def _run_episode(
         compress_npz=cfg.output.compress_npz,
     )
     activation_collector.flush_episode()
-    return final, trace, comparison, fatal
+    return final, trace, comparison, fatal, warm_start_checkpoint
 
 
 def _empty_condition_summary() -> dict[str, int | float]:
@@ -909,7 +1619,7 @@ def collect_paired_release_libero(
         f"{cfg.env.task_suite_name}-paired-release",
     )
     manifest = {
-        "schema_version": "extended_openvla_libero_paired_release_v6",
+        "schema_version": "extended_openvla_libero_paired_release_v7",
         "collection_status": "in_progress",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "code": _git_state(repo_root),
@@ -935,7 +1645,19 @@ def collect_paired_release_libero(
                 "replay exact normal model_input_rgb through trigger; retain "
                 "forced observed_source_rgb separately for audit"
             ),
-            "warm_start_hashes": "audit_only",
+            "forced_warm_start": (
+                "repeat the same seeded hard reset and controller warmup, verify "
+                "the compiled model XML fingerprint, then restore normal "
+                "mjSTATE_INTEGRATION plus OSC, gripper, robot-buffer, and "
+                "Observable state before policy step 0"
+            ),
+            "prefix_sim_state_audit": (
+                "persist and compare complete mjSTATE_INTEGRATION through trigger"
+            ),
+            "warm_start_hashes": (
+                "MuJoCo and robosuite Python checkpoints are exact restore gates; "
+                "rendered-source hashes remain audit-only"
+            ),
             "detach_confirmation_steps": cfg.paired_release.stable_detach_steps,
             "normal_termination": "official_libero_success_or_horizon",
             "primary_analysis_filter": "valid_pair and normal_success",
@@ -1092,6 +1814,7 @@ def collect_paired_release_libero(
                             normal_trace,
                             _,
                             normal_fatal,
+                            normal_warm_start_checkpoint,
                         ) = _run_episode(
                             cfg=cfg,
                             model=model,
@@ -1181,7 +1904,13 @@ def collect_paired_release_libero(
 
                         aggregate["eligible_pairs"] += 1
                         forced_episode_num = aggregate["episodes"] + 1
-                        forced, _, comparison, forced_fatal = _run_episode(
+                        (
+                            forced,
+                            _,
+                            comparison,
+                            forced_fatal,
+                            _,
+                        ) = _run_episode(
                             cfg=cfg,
                             model=model,
                             processor=processor,
@@ -1204,6 +1933,7 @@ def collect_paired_release_libero(
                             max_steps=max_steps,
                             scheduled_trigger_step=int(trigger_step),
                             normal_trace=normal_trace,
+                            normal_warm_start_checkpoint=(normal_warm_start_checkpoint),
                             reference_initial_z=float(
                                 normal["trigger"]["initial_object_z"]
                             ),

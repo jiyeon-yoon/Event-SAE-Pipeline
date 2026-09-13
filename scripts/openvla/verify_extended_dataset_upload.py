@@ -9,6 +9,13 @@ import sys
 from pathlib import Path
 
 ALLOWED_REMOTE_ONLY_FILES = frozenset({".gitattributes", "README.md"})
+PAIRED_SCHEMA_VERSIONS = frozenset(
+    {
+        "extended_openvla_libero_paired_release_v5",
+        "extended_openvla_libero_paired_release_v6",
+        "extended_openvla_libero_paired_release_v7",
+    }
+)
 
 
 def local_inventory(run_dir: str | Path) -> dict[str, int]:
@@ -74,10 +81,7 @@ def main() -> None:
     }
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     schema = manifest.get("schema_version")
-    if schema in {
-        "extended_openvla_libero_paired_release_v5",
-        "extended_openvla_libero_paired_release_v6",
-    }:
+    if schema in PAIRED_SCHEMA_VERSIONS:
         if manifest.get("collection_status") != "complete":
             raise RuntimeError("Paired collection is not marked complete")
         from event_sae.openvla.extended_collection.paired_validate import (

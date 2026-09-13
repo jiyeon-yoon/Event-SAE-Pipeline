@@ -18,9 +18,11 @@ from event_sae.openvla.extended_collection.controlled_release import (
     target_grasped,
 )
 from event_sae.openvla.extended_collection.validate import validate_extended_run
+from event_sae.openvla.extended_collection.writer import array_sha256
 
 
-PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v6"
+PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v7"
+CANONICAL_RGB_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v6"
 LEGACY_PAIRED_SCHEMA_VERSION = "extended_openvla_libero_paired_release_v5"
 
 
@@ -83,7 +85,11 @@ def _max_delta(left: np.ndarray, right: np.ndarray) -> float:
         return float("inf")
     if left.size == 0:
         return 0.0
-    return float(np.max(np.abs(left.astype(np.float64) - right.astype(np.float64))))
+    left64 = left.astype(np.float64)
+    right64 = right.astype(np.float64)
+    if not np.all(np.isfinite(left64)) or not np.all(np.isfinite(right64)):
+        return float("inf")
+    return float(np.max(np.abs(left64 - right64)))
 
 
 def _load_npz(path: Path, relative: str) -> dict[str, np.ndarray]:
@@ -104,6 +110,7 @@ def _validate_prefix(
     action_atol: float,
     state_atol: float,
     require_observed_rgb: bool,
+    require_integration_state: bool,
 ) -> dict[str, float | bool]:
     count = through_step + 1
     normal_actions = action_rows[int(normal_result["episode_num"])]
@@ -131,17 +138,60 @@ def _validate_prefix(
             f"raw={raw_delta} policy={policy_delta}"
         )
 
+    integration_state_exact = True
+    if require_integration_state:
+        normal_hashes = [
+            row.get("sim_state_integration_sha256") for row in normal_actions[:count]
+        ]
+        forced_hashes = [
+            row.get("sim_state_integration_sha256") for row in forced_actions[:count]
+        ]
+        if any(not value for value in normal_hashes + forced_hashes):
+            raise ValueError("Paired v7 rows lack MuJoCo integration-state hashes")
+        integration_state_exact = normal_hashes == forced_hashes
+        if not integration_state_exact:
+            raise ValueError(
+                "Normal/forced MuJoCo integration-state hashes differ before intervention"
+            )
+
     normal_sim = _load_npz(root, normal_result["sim_state_path"])
     forced_sim = _load_npz(root, forced_result["sim_state_path"])
+    if require_integration_state:
+        integration_key = "pre_mujoco_integration_state"
+        if integration_key not in normal_sim or integration_key not in forced_sim:
+            raise ValueError("Paired v7 NPZ lacks full MuJoCo integration state")
+        normal_flat = normal_sim[integration_key][:count]
+        forced_flat = forced_sim[integration_key][:count]
+        if len(normal_flat) != count or len(forced_flat) != count:
+            raise ValueError("Paired v7 integration-state NPZ prefix is incomplete")
+        for index in range(count):
+            if array_sha256(normal_flat[index]) != normal_hashes[index]:
+                raise ValueError(
+                    "Normal v7 integration-state hash does not match NPZ: "
+                    f"step={index}"
+                )
+            if array_sha256(forced_flat[index]) != forced_hashes[index]:
+                raise ValueError(
+                    "Forced v7 integration-state hash does not match NPZ: "
+                    f"step={index}"
+                )
+
     stateful_fields = (
         "time",
         "qpos",
         "qvel",
         "act",
+        "history",
+        "qacc_warmstart",
         "ctrl",
+        "qfrc_applied",
+        "xfrc_applied",
+        "eq_active",
         "mocap_pos",
         "mocap_quat",
         "userdata",
+        "plugin_state",
+        "mujoco_integration_state",
     )
     state_deltas: dict[str, float] = {}
     for field in stateful_fields:
@@ -183,6 +233,7 @@ def _validate_prefix(
     return {
         "rgb_exact": rgb_equal,
         "observed_rgb_exact": observed_rgb_equal,
+        "integration_state_exact": integration_state_exact,
         "max_observed_rgb_abs_delta": observed_rgb_delta,
         "max_raw_action_abs_delta": raw_delta,
         "max_policy_action_abs_delta": policy_delta,
@@ -283,10 +334,15 @@ def validate_paired_release_run(
     schema_version = manifest.get("schema_version")
     if schema_version not in (
         PAIRED_SCHEMA_VERSION,
+        CANONICAL_RGB_SCHEMA_VERSION,
         LEGACY_PAIRED_SCHEMA_VERSION,
     ):
         raise ValueError("Unexpected paired-release dataset schema")
-    canonical_prefix_replay = schema_version == PAIRED_SCHEMA_VERSION
+    canonical_prefix_replay = schema_version in (
+        PAIRED_SCHEMA_VERSION,
+        CANONICAL_RGB_SCHEMA_VERSION,
+    )
+    integration_state_replay = schema_version == PAIRED_SCHEMA_VERSION
     collection_status = manifest.get("collection_status")
     if require_complete:
         if collection_status != "complete":
@@ -663,6 +719,89 @@ def validate_paired_release_run(
                     == forced_result["warm_start_source_rgb_sha256"]
                 ),
             }
+            if integration_state_replay:
+                for result in (normal_result, forced_result):
+                    for field in (
+                        "warm_start_integration_state_sha256",
+                        "warm_start_model_xml_sha256",
+                        "warm_start_robosuite_python_state_sha256",
+                    ):
+                        if not result.get(field):
+                            raise ValueError(
+                                "Paired v7 warm-start evidence is missing: "
+                                f"{pair['pair_id']} {field}"
+                            )
+                expected_audit["warm_start_integration_state_exact"] = (
+                    normal_result["warm_start_integration_state_sha256"]
+                    == forced_result["warm_start_integration_state_sha256"]
+                )
+                expected_audit["warm_start_model_xml_exact"] = (
+                    normal_result["warm_start_model_xml_sha256"]
+                    == forced_result["warm_start_model_xml_sha256"]
+                )
+                expected_audit["warm_start_robosuite_python_state_exact"] = (
+                    normal_result["warm_start_robosuite_python_state_sha256"]
+                    == forced_result["warm_start_robosuite_python_state_sha256"]
+                )
+                if not expected_audit["warm_start_integration_state_exact"]:
+                    raise ValueError(
+                        "Paired v7 MuJoCo integration state differs: "
+                        f"{pair['pair_id']}"
+                    )
+                if not expected_audit["warm_start_model_xml_exact"]:
+                    raise ValueError(
+                        f"Paired v7 MuJoCo model XML differs: {pair['pair_id']}"
+                    )
+                if not expected_audit["warm_start_robosuite_python_state_exact"]:
+                    raise ValueError(
+                        "Paired v7 robosuite Python state differs: "
+                        f"{pair['pair_id']}"
+                    )
+                if normal_result.get("warm_start_source") != (
+                    "seeded_hard_reset_warmup_checkpoint"
+                ) or forced_result.get("warm_start_source") != (
+                    "seeded_hard_reset_then_normal_mjstate_and_python_replay"
+                ):
+                    raise ValueError(
+                        f"Paired v7 warm-start source is invalid: {pair['pair_id']}"
+                    )
+                pre_forward_delta = float(
+                    forced_result.get(
+                        "warm_start_restore_pre_forward_max_abs_delta", float("inf")
+                    )
+                )
+                post_forward_delta = float(
+                    forced_result.get(
+                        "warm_start_restore_post_forward_max_abs_delta", float("inf")
+                    )
+                )
+                post_python_state_delta = float(
+                    forced_result.get(
+                        "warm_start_restore_post_python_state_max_abs_delta",
+                        float("inf"),
+                    )
+                )
+                if pre_forward_delta != 0.0:
+                    raise ValueError(
+                        "Paired v7 mj_setState restore was not exact: "
+                        f"{pair['pair_id']} delta={pre_forward_delta}"
+                    )
+                if (
+                    not np.isfinite(post_forward_delta)
+                    or post_forward_delta > state_atol
+                ):
+                    raise ValueError(
+                        "Paired v7 post-mj_forward state exceeds tolerance: "
+                        f"{pair['pair_id']} delta={post_forward_delta}"
+                    )
+                if (
+                    not np.isfinite(post_python_state_delta)
+                    or post_python_state_delta > state_atol
+                ):
+                    raise ValueError(
+                        "Paired v7 post-Python-state state exceeds tolerance: "
+                        f"{pair['pair_id']} delta={post_python_state_delta}"
+                    )
             if pair.get("pairing_audit") != expected_audit:
                 raise ValueError(
                     f"Pairing audit does not match raw evidence: {pair['pair_id']}"
@@ -682,6 +821,30 @@ def validate_paired_release_run(
         t_detach = int(t_detach)
         t_detach_confirmed = int(t_detach_confirmed)
         trigger_step = int(trigger_step)
+        if integration_state_replay:
+            runtime_prefix = pair.get("prefix_comparison") or {}
+            if int(runtime_prefix.get("steps_compared", -1)) != t_cmd + 1:
+                raise ValueError(
+                    f"Paired v7 prefix comparison is incomplete: {pair['pair_id']}"
+                )
+            runtime_integration_delta = float(
+                runtime_prefix.get("max_integration_state_abs_delta", float("inf"))
+            )
+            if (
+                not np.isfinite(runtime_integration_delta)
+                or runtime_integration_delta > state_atol
+            ):
+                raise ValueError(
+                    "Paired v7 integration-state prefix exceeds tolerance: "
+                    f"{pair['pair_id']}"
+                )
+            if runtime_prefix.get("integration_state_exact") is not True:
+                raise ValueError(
+                    "Paired v7 integration-state prefix is not bit-exact: "
+                    f"{pair['pair_id']}"
+                )
+            if runtime_prefix.get("first_mismatch_step") is not None:
+                raise ValueError(f"Paired v7 prefix has a mismatch: {pair['pair_id']}")
         if t_cmd != trigger_step or t_detach < t_cmd or t_detach_confirmed < t_detach:
             raise ValueError(f"Invalid release timestamp order: {pair['pair_id']}")
         if t_detach_confirmed - t_cmd + 1 > max_force_steps:
@@ -704,7 +867,7 @@ def validate_paired_release_run(
             action_atol=action_atol,
             require_policy_input_provenance=canonical_prefix_replay,
         )
-        prefix_metrics[pair["pair_id"]] = _validate_prefix(
+        offline_prefix = _validate_prefix(
             root,
             normal_result,
             forced_result,
@@ -713,7 +876,18 @@ def validate_paired_release_run(
             action_atol=action_atol,
             state_atol=state_atol,
             require_observed_rgb=canonical_prefix_replay,
+            require_integration_state=integration_state_replay,
         )
+        if integration_state_replay:
+            runtime_prefix = pair["prefix_comparison"]
+            if bool(runtime_prefix.get("integration_state_exact")) != bool(
+                offline_prefix["integration_state_exact"]
+            ):
+                raise ValueError(
+                    "Paired v7 runtime/offline integration hash audit differs: "
+                    f"{pair['pair_id']}"
+                )
+        prefix_metrics[pair["pair_id"]] = offline_prefix
         detach_checks[(forced_num, t_detach)] = pair
         for confirmation_step in range(t_detach, t_detach_confirmed + 1):
             confirmation_checks[(forced_num, confirmation_step)] = pair

@@ -3,9 +3,11 @@
 이 수집기는 기존 Event-SAE 수집기를 수정하거나 호출하지 않는다. 같은
 LIBERO initial state와 seed에서 `normal`을 먼저 실행한 뒤, 안정적인
 grasp+lift가 확인된 시점에 gripper만 강제로 여는 `forced_release`를 실행한다.
-렌더러의 미세한 비결정성이 정책 행동을 바꾸지 않도록 forced 조건은 trigger
-시점까지 normal의 model-input RGB를 그대로 재사용한다. forced 환경에서 실제로
-관측된 RGB는 별도로 저장하며, simulator state 차이는 허용오차 안인지 검증한다.
+normal과 forced 모두 같은 seeded hard reset과 warmup을 수행한다. forced는 model
+XML fingerprint를 확인한 뒤 normal의 warmup 완료 `mjSTATE_INTEGRATION`, OSC 목표,
+gripper 누적 명령, robot buffer, Observable 상태와 Python·NumPy·Torch RNG를 함께
+복원한다. trigger까지 normal의 model-input RGB도 재사용한다. 실제 관측 RGB는
+audit으로 남기고, MuJoCo integration state는 매 step bit-exact로 검증한다.
 
 한 번의 수집으로 normal/premature release 비교, Layer 31 raw-hidden probe,
 SAE Top-K와 시간 지표, object/contact/reward/predicate 기반 실패 분석에 필요한
@@ -34,7 +36,7 @@ release는 primary 필수 조건이 아니며, `t_cmd`·`t_detach`·`t_obs`의 �
 | object·fixture pose와 선/각속도, robot joint·EEF·gripper 상태 | 접근→grasp→lift→drop→placement의 물리 변화와 실패 위치 분석 |
 | 활성 MuJoCo contact·contact force·geom owner, object별 grasp flag | 접촉·grasp·detach를 주관적 라벨 없이 판정 |
 | reward·done·success·info, BDDL goal predicate의 step 전/후 만족 여부 | 성공 여부와 목표 진행 상태를 simulator 기준으로 판정 |
-| qpos·qvel·act·ctrl·force·sensor 등 지정된 simulator vector의 step 전/후 값 | 두 조건의 intervention 이전 동역학이 같은지 검증하고 후처리 분석 |
+| 전체 `mjSTATE_INTEGRATION`과 qpos·qvel·qacc_warmstart·ctrl·applied force 등 simulator vector의 step 전/후 값 | intervention 이전 MuJoCo forward-dynamics 입력이 같은지 독립적으로 검증하고 후처리 분석 |
 | raw OpenVLA action, LIBERO 변환 action, 실제 실행 action, gripper override | 강제-release에서 gripper만 바뀌었는지 확인하고 행동 변화 추적 |
 | token ID와 entropy·top-1 probability·margin 등 요약값 | OpenVLA의 256개 action token 전체에서 full logits 없이 정책 불확실성 분석 |
 | 정책에 전달한 model-input RGB, 실제 관측 source RGB, rollout MP4 | 동일 policy prefix를 보장하면서 실제 장면 차이도 별도로 감사·확인 |
@@ -60,8 +62,12 @@ feature intervention 결과는 정책을 다시 실행해야 하므로 별도 ro
 | 목표 미달 시 실패 상태·완료 마커 미생성 | 불완전 데이터를 정상 완료본으로 업로드·사용하지 않기 위해 |
 | 전체 10개 task smoke test | 본 수집 전에 task별 trigger, normal 성공, 강제 detach, 저장 구조 문제 확인 |
 | trigger까지 normal model-input RGB 재사용 | reset 후 RGB 재렌더링 차이가 intervention 전 OpenVLA action을 바꾸는 문제 방지 |
-| 실제 forced source RGB 별도 저장 + simulator state tolerance 검증 | 정책 입력 고정이 실제 물리 상태 차이를 숨기지 않도록 감사 가능하게 보존 |
-| warm-start RGB/state hash를 audit-only로 기록 | 부동소수점·렌더링의 무의미한 exact-hash 차이로 올바른 pair를 폐기하지 않기 위해 |
+| normal·forced에 같은 seeded hard reset·warmup 적용 | reset lifecycle 차이가 paired 조건에 섞이는 문제 방지 |
+| model XML 확인 후 MuJoCo·robosuite·RNG 상태 복원 | solver warm-start뿐 아니라 OSC 목표·gripper 누적값·buffer·Observable·Python/NumPy/Torch RNG까지 같은 상태에서 시작 |
+| `mj_setState` 직후·`mj_forward` 후·Python 상태 복원 후 검사 | 복원 오차가 생긴 단계를 구분하고 허용 오차를 넘으면 즉시 중단 |
+| step별 전체 `mjSTATE_INTEGRATION` 값·hash 저장 | runtime 요약만 신뢰하지 않고 저장된 NPZ로 prefix 일치 여부를 재검증 |
+| 실제 forced source RGB 별도 저장 + 전체 state tolerance 검증 | 정책 입력 고정이 실제 물리 상태 차이를 숨기지 않도록 감사 가능하게 보존 |
+| warm-start 증거를 역할별로 분리 | model XML·integration·Python checkpoint는 필수 gate, 렌더 RGB·legacy summary hash는 audit 용도로 구분 |
 
 현재 본 수집의 task별 `valid=20`, `primary=20`은 논문이 보장한 표본 수가
 아니라 **분석 가능한 최소 cohort를 확보하기 위한 품질 gate**다. 목표 충족 시
@@ -101,10 +107,68 @@ python -m pytest -q \
   tests/test_paired_pair_quota.py \
   tests/test_paired_release_config.py \
   tests/test_canonical_prefix_replay.py \
-  tests/test_paired_release_validator.py
+  tests/test_mujoco_integration_checkpoint.py \
+  tests/test_paired_replay_runtime.py \
+  tests/test_paired_release_validator.py \
+  tests/test_verify_extended_dataset_upload.py
 ```
 
-## 2. Smoke test
+## 2. 저비용 실제 LIBERO replay 검사
+
+OpenVLA 7B를 로드하거나 activation을 저장하지 않고 Task 4의 MuJoCo·controller·
+gripper 상태 복원만 검사한다. 먼저 이것을 실행한다.
+
+```bash
+python scripts/openvla/verify_paired_replay_runtime.py \
+  --task-id 4 \
+  --trial-index 0 \
+  --steps 12
+```
+
+`PAIRED_REPLAY_RUNTIME_OK`가 나와야 다음 수집으로 넘어간다. 실패하면 유료 OpenVLA
+smoke 및 전체 수집을 실행하지 않는다. `agentview_rgb_exact=false`만 나온 경우는
+실패가 아니며, 물리·controller 상태와 수치 관측은 별도 gate로 통과한다.
+
+## 3. Task 4 OpenVLA 1-pair gate
+
+저비용 replay 검사가 통과해도 실제 OpenVLA·activation hook 경로는 별도 확인해야
+한다. 과거 오류가 난 Task 4의 기존 유효 seed 한 개만 먼저 실행한다.
+
+```bash
+cd /workspace/Event-SAE-Pipeline
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+TASK_ID=4
+GATE_ROOT="/workspace/results/paired-release-v7-gate-${EVENT_SAE_COMMIT:0:7}-task-$TASK_ID"
+mkdir -p "$GATE_ROOT"
+set -uo pipefail
+set +e
+
+python scripts/openvla/collect_paired_release_dataset.py \
+  --config configs/research/openvla/collect_libero_spatial_paired_release_layer31.yaml \
+  --override env.task_ids="$TASK_ID" \
+  --override env.num_trials_per_task=1 \
+  --override paired_release.target_valid_pairs_per_task=1 \
+  --override paired_release.target_primary_pairs_per_task=1 \
+  --override output.root_dir="$GATE_ROOT" \
+  2>&1 | tee "$GATE_ROOT/collect.log"
+
+PIPE_STATUSES=("${PIPESTATUS[@]}")
+set -e
+echo "COLLECT_EXIT_CODE=${PIPE_STATUSES[0]} TEE_EXIT_CODE=${PIPE_STATUSES[1]}"
+test "${PIPE_STATUSES[0]}" -eq 0 || { echo "TASK4_GATE_FAILED"; exit 1; }
+test "${PIPE_STATUSES[1]}" -eq 0 || { echo "LOG_WRITE_FAILED"; exit 1; }
+
+GATE_DIR=$(find "$GATE_ROOT" -mindepth 1 -maxdepth 1 \
+  -type d -name 'EXTENDED-libero_spatial-paired-release-openvla-*' \
+  | sort | tail -1)
+test -n "$GATE_DIR"
+cp "$GATE_ROOT/collect.log" "$GATE_DIR/collect.log"
+python scripts/openvla/validate_paired_release_dataset.py --run-dir "$GATE_DIR"
+```
+
+`PAIRED_RELEASE_DATASET_OK`가 나와야 0~9 smoke test로 넘어간다.
+
+## 4. OpenVLA smoke test
 
 한 run에는 task 하나만 넣는다. 아래 `TASK_ID`를 0~9로 바꿔 각 task를
 한 번씩 확인한다. 5개 Pod를 쓴다면 Pod마다 두 task를 순차 실행한다.
@@ -119,9 +183,10 @@ tmux new -s paired-release-smoke
 cd /workspace/Event-SAE-Pipeline
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 TASK_ID=0
-SMOKE_ROOT="/workspace/results/paired-release-smoke-task-$TASK_ID"
+SMOKE_ROOT="/workspace/results/paired-release-v7-${EVENT_SAE_COMMIT:0:7}-task-$TASK_ID"
 mkdir -p "$SMOKE_ROOT"
 set -uo pipefail
+set +e
 
 python scripts/openvla/collect_paired_release_dataset.py \
   --config configs/research/openvla/collect_libero_spatial_paired_release_layer31.yaml \
@@ -133,6 +198,7 @@ python scripts/openvla/collect_paired_release_dataset.py \
   2>&1 | tee "$SMOKE_ROOT/collect.log"
 
 PIPE_STATUSES=("${PIPESTATUS[@]}")
+set -e
 echo "COLLECT_EXIT_CODE=${PIPE_STATUSES[0]} TEE_EXIT_CODE=${PIPE_STATUSES[1]}"
 test "${PIPE_STATUSES[0]}" -eq 0 || { echo "COLLECTION_FAILED"; exit 1; }
 test "${PIPE_STATUSES[1]}" -eq 0 || { echo "LOG_WRITE_FAILED"; exit 1; }
@@ -168,11 +234,12 @@ python scripts/openvla/validate_paired_release_dataset.py \
 
 raw record·task별 quota·semantic validation이 모두 통과한 경우에만
 manifest와 `COLLECTION_COMPLETE`를 완료 처리한다.
-`--finalize-incomplete`는 저장된 값을 수정하지 않는다. 이전 v4의
-255-token uncertainty는 복구할 수 없으므로, v6로 1-pair smoke를 다시
-통과한 후에만 본 수집을 시작한다.
+`--finalize-incomplete`는 rollout 원천 record를 수정하지 않지만, 검증에
+성공하면 manifest와 완료 marker를 갱신한다. 현재 schema에 필요한 원천 증거가 없는
+이전 run은 finalize할 수 없다. 최신
+commit의 저비용 replay 검사와 10개 task smoke가 모두 통과한 뒤 본 수집을 시작한다.
 
-## 3. 전체 수집과 업로드
+## 5. 전체 수집과 업로드
 
 10개 task를 5개 Pod에 나누되 **각 task를 별도 run으로 순차 실행**한다.
 두 번째 task가 실패해도 첫 번째 task의 검증·업로드 결과는 보존된다.

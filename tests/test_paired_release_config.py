@@ -56,6 +56,8 @@ def test_paired_config_loads_mappings_and_overrides(tmp_path: Path):
         ("paired_release.stable_detach_steps=0", "stable_detach_steps"),
         ("paired_release.forced_gripper_value=1", "forced_gripper_value"),
         ("paired_release.action_atol=-1", "tolerances"),
+        ("paired_release.action_atol=.nan", "finite"),
+        ("paired_release.state_atol=.inf", "finite"),
         (
             "paired_release.target_valid_pairs_per_task=0",
             "target_valid_pairs_per_task",

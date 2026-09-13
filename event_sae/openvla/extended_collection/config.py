@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict
@@ -231,6 +232,8 @@ def validate_paired_release_config(cfg: PairedReleaseRunConfig) -> None:
         raise ValueError(
             "LIBERO paired release is fixed to forced_gripper_value=-1.0 (open)"
         )
+    if not math.isfinite(paired.action_atol) or not math.isfinite(paired.state_atol):
+        raise ValueError("paired release tolerances must be finite")
     if paired.action_atol < 0 or paired.state_atol < 0:
         raise ValueError("paired release tolerances cannot be negative")
     if paired.target_valid_pairs_per_task <= 0:
